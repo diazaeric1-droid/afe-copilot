@@ -31,7 +31,7 @@ def analyze_variance(afe_df: pd.DataFrame, actuals_df: pd.DataFrame) -> Variance
         afe_total=("line_total_usd", "sum"),
         actual_total=("actual_usd", "sum"),
     )
-    by_afe["pct"] = (by_afe["actual_total"] - by_afe["afe_total"]) / by_afe["afe_total"] * 100
+    by_afe["pct"] = (by_afe["actual_total"] - by_afe["afe_total"]) / by_afe["afe_total"].replace(0, pd.NA) * 100
 
     by_cat = merged.groupby("category").agg(
         afe_total=("line_total_usd", "sum"),
@@ -43,12 +43,15 @@ def analyze_variance(afe_df: pd.DataFrame, actuals_df: pd.DataFrame) -> Variance
     worst_cat = by_cat.index[0] if not by_cat.empty else None
     worst_pct = float(by_cat["pct"].iloc[0]) if not by_cat.empty else 0.0
 
+    total_afe = float(by_afe["afe_total"].sum())
+    total_actual = float(by_afe["actual_total"].sum())
+    overall_pct = ((total_actual - total_afe) / total_afe * 100) if total_afe else 0.0
+
     return VarianceSummary(
         n_afes=int(by_afe.shape[0]),
-        total_afe_usd=float(by_afe["afe_total"].sum()),
-        total_actual_usd=float(by_afe["actual_total"].sum()),
-        overall_variance_pct=float((by_afe["actual_total"].sum() - by_afe["afe_total"].sum())
-                                   / by_afe["afe_total"].sum() * 100),
+        total_afe_usd=total_afe,
+        total_actual_usd=total_actual,
+        overall_variance_pct=float(overall_pct),
         over_budget_count=int((by_afe["pct"] > 0).sum()),
         worst_offender_category=worst_cat,
         worst_offender_pct=worst_pct,

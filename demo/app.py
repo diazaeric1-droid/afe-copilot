@@ -13,16 +13,42 @@ if str(REPO_ROOT) not in sys.path:
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
-from src.cost_db import COST_TEMPLATES, benchmark_summary
+from src import __version__
+from src.cost_db import COST_TEMPLATES, benchmark_summary, total_estimate
 from src.drafter import AFEDiagnosis, run_drafter
+from src.economics import simulate_economics
+from src.models import AFEDiagnosis as AFEDiagnosisModel
 from src.tracker import AFETracker, seed_demo_data
 
 
 st.set_page_config(page_title="AFE Copilot", page_icon="📝", layout="wide")
-st.title("AFE Copilot")
+
+_title_col, _badge_col = st.columns([0.8, 0.2])
+with _title_col:
+    st.title("AFE Copilot")
+with _badge_col:
+    st.markdown(
+        f"<div style='text-align:right;margin-top:1.5rem;'>"
+        f"<span style='background:#1F3A5F;color:#fff;padding:3px 10px;"
+        f"border-radius:12px;font-size:0.85rem;font-weight:600;'>v{__version__}</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 st.caption("Draft, track, and analyze AFEs — built for multi-rig E&P operators.")
+
+with st.expander(f"🆕 What's new in v{__version__}"):
+    st.markdown(
+        "- **Monte-Carlo AFE economics** (P10/P50/P90 + tornado sensitivity)\n"
+        "- **Validated one-click chain from Production Engineer Copilot** "
+        "(schema validation, friendly errors)\n"
+        "- **Contingency now computed from its stated %** (cost table can't drift from the math)\n"
+        "- **docx generation decoupled from the Anthropic SDK**\n"
+        "- **Fixed payout off-by-one**; variance no longer crashes on empty input; "
+        "Word tables render bold (no literal `**`)"
+    )
 
 DB_PATH = Path("pipeline.sqlite")
 if not DB_PATH.exists():
@@ -61,6 +87,55 @@ with tab_pipeline:
 
 # ------------ Drafter tab ---------------------------------------------------
 with tab_drafter:
+    # ---- One-click chain from Production Engineer Copilot -------------------
+    with st.expander("🔗 Chain from Production Engineer Copilot (paste diagnosis JSON)"):
+        st.caption(
+            "Paste a diagnosis exported by the Production Engineer Copilot (Project 1). "
+            "It is validated before it can become an AFE — invalid fields are reported "
+            "in plain English instead of a stack trace."
+        )
+        pe_upload = st.file_uploader("Upload PE-Copilot diagnosis .json", type=["json"],
+                                     key="pe_copilot_upload")
+        pe_text = st.text_area("…or paste the diagnosis JSON here", height=160,
+                               key="pe_copilot_text")
+
+        if st.button("Validate & load into drafter", key="pe_copilot_load"):
+            raw = None
+            if pe_upload is not None:
+                raw = pe_upload.getvalue().decode("utf-8")
+            elif pe_text.strip():
+                raw = pe_text
+            if not raw:
+                st.warning("Paste JSON or upload a file first.")
+            else:
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError as e:
+                    st.error(f"That isn't valid JSON: {e}")
+                else:
+                    try:
+                        diag = AFEDiagnosisModel.from_pe_copilot(payload)
+                    except ValueError as e:
+                        st.error("Diagnosis rejected:")
+                        for line in str(e).splitlines():
+                            st.markdown(line)
+                    else:
+                        st.session_state["pe_preset"] = {
+                            "well_id": diag.well_id,
+                            "api_number": diag.api_number,
+                            "field": diag.field,
+                            "operator": diag.operator,
+                            "intervention": diag.intervention,
+                            "primary_diagnosis": diag.primary_diagnosis,
+                            "incremental_rate_bopd": diag.incremental_rate_bopd,
+                            "expected_uplift_decline_per_yr": diag.expected_uplift_decline_per_yr,
+                            "requested_by": diag.requested_by,
+                        }
+                        st.success(
+                            f"Validated diagnosis for {diag.well_id} "
+                            f"({diag.intervention}). Fields loaded below."
+                        )
+
     st.subheader("Generate a new AFE")
     examples_dir = Path("examples")
     sample_files = sorted(examples_dir.glob("well_diagnosis*.json")) if examples_dir.exists() else []
@@ -73,6 +148,9 @@ with tab_drafter:
     if chosen != "(custom)":
         with open(chosen) as f:
             preset = json.load(f)
+    elif "pe_preset" in st.session_state:
+        # a validated diagnosis loaded from the Production Engineer Copilot
+        preset = st.session_state["pe_preset"]
     else:
         preset = {}
 
@@ -88,6 +166,57 @@ with tab_drafter:
     incremental_rate = st.number_input("Incremental uplift (BOPD)", value=float(preset.get("incremental_rate_bopd", 100)))
     decline = st.number_input("Uplift decline (per year)", value=float(preset.get("expected_uplift_decline_per_yr", 0.6)))
     requested_by = st.text_input("Requested by", value=preset.get("requested_by", "Eric Diaz, Staff PE"))
+
+    # ---- Monte-Carlo economics (pure numpy — no API key needed) -------------
+    st.markdown("---")
+    st.subheader("Probabilistic economics (Monte-Carlo)")
+    st.caption(
+        "10,000 trials over incremental rate (±30%), uplift decline (±0.15 abs), "
+        "and realized price (~$12 sd). Treatment cost is the benchmark estimate for "
+        "the selected intervention."
+    )
+    if st.button("Run Monte-Carlo NPV"):
+        if incremental_rate <= 0:
+            st.error("Incremental uplift must be greater than 0 to run economics.")
+        else:
+            treatment_cost = total_estimate(intervention)
+            mc = simulate_economics(
+                treatment_cost_usd=treatment_cost,
+                incremental_rate_bopd=incremental_rate,
+                uplift_decline_per_yr=decline,
+            )
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("P10 NPV (downside)", f"${mc.npv_p10_usd/1e6:,.2f}M")
+            m2.metric("P50 NPV (median)", f"${mc.npv_p50_usd/1e6:,.2f}M")
+            m3.metric("P90 NPV (upside)", f"${mc.npv_p90_usd/1e6:,.2f}M")
+            m4.metric("P(payout < 24 mo)", f"{mc.probability_of_payout*100:.0f}%")
+
+            # Tornado chart: bars sorted by swing, centered on base NPV.
+            items = sorted(mc.tornado.items(), key=lambda kv: kv[1]["swing"])
+            labels = [k.replace("_", " ") for k, _ in items]
+            lows = [v["low"] for _, v in items]
+            highs = [v["high"] for _, v in items]
+            base = mc.base_npv_usd
+            fig_t = go.Figure()
+            fig_t.add_trace(go.Bar(
+                y=labels, x=[base - lo for lo in lows], base=lows,
+                orientation="h", name="downside", marker_color="#C0504D",
+                hovertemplate="low NPV: $%{base:,.0f}<extra></extra>",
+            ))
+            fig_t.add_trace(go.Bar(
+                y=labels, x=[hi - base for hi in highs], base=base,
+                orientation="h", name="upside", marker_color="#4F81BD",
+                hovertemplate="high NPV: $%{x:,.0f}<extra></extra>",
+            ))
+            fig_t.add_vline(x=base, line_dash="dash", line_color="#1F3A5F",
+                            annotation_text=f"base ${base/1e6:,.2f}M")
+            fig_t.update_layout(
+                barmode="overlay", height=300, showlegend=True,
+                margin=dict(l=0, r=0, t=20, b=0),
+                xaxis_title="NPV @ 10% (USD)",
+                title="Tornado — NPV swing per variable",
+            )
+            st.plotly_chart(fig_t, use_container_width=True)
 
     if st.button("Draft AFE", type="primary"):
         if not well_id or not diagnosis_text:

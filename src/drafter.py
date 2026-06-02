@@ -19,26 +19,8 @@ from rich.console import Console
 
 from .cost_db import COST_TEMPLATES, lookup_cost_template, total_estimate
 from .economics import compute_economics
+from .models import AFEDiagnosis  # dataclass lives in models.py (no anthropic dependency)
 from .risk_register import lookup_risks
-
-
-@dataclass
-class AFEDiagnosis:
-    """Input to the drafter. Typically produced by Project 1 (Production Engineer Copilot)."""
-    well_id: str
-    api_number: str
-    field: str
-    operator: str
-    intervention: str                    # Must match a key in cost_db.COST_TEMPLATES
-    primary_diagnosis: str               # Free-form, e.g., "Scale + low intake + below POR"
-    incremental_rate_bopd: float
-    expected_uplift_decline_per_yr: float = 0.6
-    requested_by: str = "Senior Production Engineer"
-
-    @classmethod
-    def from_json(cls, path: str | Path) -> "AFEDiagnosis":
-        with Path(path).open() as f:
-            return cls(**json.load(f))
 
 
 # ---------- tool schemas (Anthropic tool-use API) ----------------------------

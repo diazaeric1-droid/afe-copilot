@@ -3,6 +3,10 @@
 In production this would be backed by the operator's actual AFE database
 (SAP, Quorum, Oracle, etc.). For the open-source demo, ships with synthetic
 Permian-basin-realistic values an engineer would recognize.
+
+Contingency is computed programmatically from the stated percentage of direct
+cost (see CONTINGENCY_PCT), so the line-item label can never disagree with the
+arithmetic.
 """
 from __future__ import annotations
 
@@ -36,7 +40,8 @@ class LineItem:
         return self.qty * self.unit_cost_usd
 
 
-# Reference line-item templates per intervention.
+# Reference DIRECT-cost line-item templates per intervention (contingency added
+# programmatically by lookup_cost_template).
 # Costs reflect Delaware/Midland Basin Q1 2026 going rates (synthetic but realistic).
 COST_TEMPLATES: dict[InterventionType, list[LineItem]] = {
     "acid_stimulation": [
@@ -46,7 +51,6 @@ COST_TEMPLATES: dict[InterventionType, list[LineItem]] = {
         LineItem("Diverter package",    "Solid diverter w/ ball sealers",      "lump",    1,   14_500, "BJ Energy"),
         LineItem("Wellsite supervision","Company man + co-man, 4 days",        "day",     4,    2_400, None),
         LineItem("Flowback / disposal", "Flowback equipment + SWD trucking",   "day",     5,    6_200, "Liberty"),
-        LineItem("Contingency",         "10% contingency on direct cost",      "lump",    1,   18_500, None),
     ],
     "scale_treatment": [
         LineItem("Coiled tubing unit",  "CTU for inhibitor squeeze",           "day",     1,   35_000, "Halliburton"),
@@ -54,7 +58,6 @@ COST_TEMPLATES: dict[InterventionType, list[LineItem]] = {
         LineItem("HCl wash",            "5% HCl pre-wash, 1,500 gal",          "lump",    1,    9_800, "Multi-Chem"),
         LineItem("Wellsite supervision","Company man, 2 days",                 "day",     2,    1_200, None),
         LineItem("Flowback",            "Flowback equipment, 3 days",          "day",     3,    5_400, "Liberty"),
-        LineItem("Contingency",         "10% contingency",                     "lump",    1,    7_300, None),
     ],
     "esp_swap": [
         LineItem("Workover rig",        "Pulling unit, 6 days",                "day",     6,   22_000, "Permian WOR"),
@@ -63,7 +66,6 @@ COST_TEMPLATES: dict[InterventionType, list[LineItem]] = {
         LineItem("VSD + transformer",   "Surface VSD package",                 "lump",    1,   42_000, "Yaskawa"),
         LineItem("Tubing inspection",   "Tubing tally + EMI inspection",       "ft",  5_000,         2.5, None),
         LineItem("Wellsite supervision","Company man + co-man, 6 days",        "day",     6,    2_400, None),
-        LineItem("Contingency",         "10% contingency",                     "lump",    1,   33_000, None),
     ],
     "esp_to_beam_conversion": [
         LineItem("Workover rig",        "Pulling unit, 7 days",                "day",     7,   22_000, "Permian WOR"),
@@ -73,7 +75,6 @@ COST_TEMPLATES: dict[InterventionType, list[LineItem]] = {
         LineItem("Surface motor + VFD", "20 HP w/ VFD",                        "lump",    1,   28_000, "Toshiba"),
         LineItem("Foundation + pad",    "Concrete pad + anchors",              "lump",    1,   18_500, None),
         LineItem("Wellsite supervision","Company man, 7 days",                 "day",     7,    1_200, None),
-        LineItem("Contingency",         "15% contingency (conversion risk)",   "lump",    1,   42_000, None),
     ],
     "rod_pump_workover": [
         LineItem("Workover rig",        "Pulling unit, 3 days",                "day",     3,   18_000, "Permian WOR"),
@@ -81,21 +82,18 @@ COST_TEMPLATES: dict[InterventionType, list[LineItem]] = {
         LineItem("Replacement rods",    "Replace failed section, 200 ft",      "ft",    200,         9, "Norris"),
         LineItem("Downhole pump",       "Refurb 1.5-in plunger if needed",     "lump",    1,    5_200, "Don-Nan"),
         LineItem("Wellsite supervision","Company man, 3 days",                 "day",     3,    1_200, None),
-        LineItem("Contingency",         "10% contingency",                     "lump",    1,    9_500, None),
     ],
     "gas_lift_optimization": [
         LineItem("Wireline unit",       "Slickline for valve change",          "day",     1,    8_500, "Halliburton"),
         LineItem("Gas lift valves",     "Replace bottom 3 mandrels",           "ea",      3,    2_800, "Camco"),
         LineItem("Injection optimization","Engineering review + model rerun",  "lump",    1,    6_000, None),
         LineItem("Wellsite supervision","Company man, 1 day",                  "day",     1,    1_200, None),
-        LineItem("Contingency",         "10% contingency",                     "lump",    1,    2_500, None),
     ],
     "paraffin_treatment": [
         LineItem("Hot oil truck",       "Hot oiler, 80 bbl @ 180°F",           "trip",    1,    7_500, "Select"),
         LineItem("Wireline plunger",    "Inspect + replace plunger",           "lump",    1,    3_500, None),
         LineItem("Paraffin inhibitor",  "Continuous chemical, 30-day supply",  "lump",    1,    4_200, "Multi-Chem"),
         LineItem("Wellsite supervision","Company man, 1 day",                  "day",     1,    1_200, None),
-        LineItem("Contingency",         "10% contingency",                     "lump",    1,    1_700, None),
     ],
     "p_and_a": [
         LineItem("Workover rig",        "P&A rig, 5 days",                     "day",     5,   24_000, "Permian WOR"),
@@ -104,21 +102,49 @@ COST_TEMPLATES: dict[InterventionType, list[LineItem]] = {
         LineItem("Wireline plugs",      "Mechanical plug sets",                "ea",      4,    4_500, "Halliburton"),
         LineItem("Surface restoration", "Cellar cleanup, signage",             "lump",    1,   12_000, None),
         LineItem("Regulatory filing",   "RRC W-3 filing + bond release",       "lump",    1,    3_500, None),
-        LineItem("Contingency",         "15% contingency (downhole risk)",     "lump",    1,   30_000, None),
     ],
 }
 
 
+# Contingency as a fraction of DIRECT cost, per intervention. Higher-risk jobs
+# (conversions, P&A downhole risk) carry 15%.
+CONTINGENCY_PCT: dict[InterventionType, float] = {
+    "acid_stimulation":       0.10,
+    "scale_treatment":        0.10,
+    "esp_swap":               0.10,
+    "esp_to_beam_conversion": 0.15,
+    "rod_pump_workover":      0.10,
+    "gas_lift_optimization":  0.10,
+    "paraffin_treatment":     0.10,
+    "p_and_a":                0.15,
+}
+
+
+def _contingency_line(intervention: InterventionType, direct_items: list[LineItem]) -> LineItem:
+    """Build the contingency line as an exact percentage of direct cost."""
+    pct = CONTINGENCY_PCT[intervention]
+    direct_total = sum(i.total_usd for i in direct_items)
+    return LineItem(
+        category="Contingency",
+        description=f"{pct:.0%} contingency on direct cost",
+        unit="lump",
+        qty=1,
+        unit_cost_usd=round(pct * direct_total),
+        vendor=None,
+    )
+
+
 def lookup_cost_template(intervention: InterventionType) -> list[LineItem]:
-    """Return the canonical line-item list for an intervention type."""
+    """Return the canonical line-item list (direct lines + computed contingency)."""
     if intervention not in COST_TEMPLATES:
         raise ValueError(f"Unknown intervention: {intervention}. "
                          f"Known: {list(COST_TEMPLATES)}")
-    return [LineItem(**item.__dict__) for item in COST_TEMPLATES[intervention]]
+    direct = [LineItem(**item.__dict__) for item in COST_TEMPLATES[intervention]]
+    return direct + [_contingency_line(intervention, direct)]
 
 
 def total_estimate(intervention: InterventionType) -> float:
-    return sum(item.total_usd for item in COST_TEMPLATES[intervention])
+    return sum(item.total_usd for item in lookup_cost_template(intervention))
 
 
 def benchmark_summary() -> dict[str, float]:

@@ -8,7 +8,7 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt, RGBColor, Inches
 
-from .drafter import AFEDiagnosis
+from .models import AFEDiagnosis
 
 
 BRAND_COLOR = RGBColor(0x1F, 0x3A, 0x5F)
@@ -44,12 +44,16 @@ def _add_markdown_table(doc: Document, lines: list[str]):
         for j in range(n_cols):
             cell_text = row_cells[j] if j < len(row_cells) else ""
             cell = table.rows[i].cells[j]
-            cell.text = cell_text
-            for paragraph in cell.paragraphs:
-                for run in paragraph.runs:
-                    run.font.size = Pt(9)
-                    if i == 0:
-                        run.bold = True
+            # Render markdown **bold** spans instead of leaking literal asterisks.
+            paragraph = cell.paragraphs[0]
+            paragraph.text = ""
+            for part in re.split(r"(\*\*[^*]+\*\*)", cell_text):
+                if not part:
+                    continue
+                is_bold = part.startswith("**") and part.endswith("**")
+                run = paragraph.add_run(part[2:-2] if is_bold else part)
+                run.font.size = Pt(9)
+                run.bold = bool(is_bold or i == 0)
 
 
 def _add_paragraph(doc: Document, text: str):
