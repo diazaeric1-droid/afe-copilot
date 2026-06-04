@@ -1,3 +1,15 @@
+---
+title: AFE Copilot
+emoji: 📝
+colorFrom: blue
+colorTo: green
+sdk: streamlit
+sdk_version: 1.50.0
+app_file: demo/app.py
+pinned: true
+license: mit
+---
+
 # AFE Copilot
 
 > An open-source AI system that drafts AFEs in 5 minutes, tracks the approval pipeline, and analyzes post-execution variance — built for operators running multi-rig workover programs.
