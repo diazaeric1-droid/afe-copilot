@@ -5,6 +5,12 @@ All notable changes to AFE Copilot are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-06-02
+
+- Republish to force a clean Streamlit Cloud rebuild (the v0.3.0 deploy served a
+  stale build that failed importing `simulate_economics`). No functional change —
+  the source was already correct.
+
 ## [0.3.0] — 2026-06-02
 
 - Monte-Carlo AFE economics (P10/P50/P90 + tornado sensitivity)
