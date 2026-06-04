@@ -136,12 +136,13 @@ Style:
 """
 
 
-def run_drafter(diagnosis: AFEDiagnosis, model: str = "claude-sonnet-4-6", verbose: bool = False) -> str:
+def run_drafter(diagnosis: AFEDiagnosis, model: str = "claude-sonnet-4-6", verbose: bool = False,
+                api_key: str | None = None) -> str:
     load_dotenv()
-    key = os.environ.get("ANTHROPIC_API_KEY")
+    key = api_key or os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         raise MissingAPIKey(
-            "ANTHROPIC_API_KEY is not set — set it to draft the AFE narrative. "
+            "ANTHROPIC_API_KEY is not set — provide a key to draft the AFE narrative. "
             "Cost tables, Monte-Carlo economics, and .docx export work without a key.")
     from anthropic import Anthropic
     client = Anthropic(api_key=key)

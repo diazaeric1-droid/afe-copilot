@@ -15,11 +15,11 @@ license: mit
 
 Built by a Staff Production Engineer (ex-OXY, ex-Shell) who has written hundreds of AFEs by hand.
 
-[![Live Demo](https://img.shields.io/badge/demo-live-brightgreen)](https://afe-copilot.streamlit.app)
+[![Live Demo](https://img.shields.io/badge/demo-live-brightgreen)](https://diazaeric1-afe-copilot.hf.space)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11+-blue)](https://www.python.org/)
 
-**Try it now → [afe-copilot.streamlit.app](https://afe-copilot.streamlit.app)**
+**Try it now → [diazaeric1-afe-copilot.hf.space](https://diazaeric1-afe-copilot.hf.space)**
 
 ---
 

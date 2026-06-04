@@ -59,6 +59,14 @@ with _badge_col:
     )
 st.caption("Draft, track, and analyze AFEs — built for multi-rig E&P operators.")
 
+with st.sidebar:
+    st.header("AI drafting")
+    byok_key = st.text_input(
+        "🔑 Anthropic API key (optional)", type="password",
+        help="Bring your own key — used only for this session, never stored. Powers the "
+             "AI-written AFE narrative. Cost tables, tangible/intangible split, net economics, "
+             "price deck, variance, and Monte-Carlo all work without it.")
+
 with st.expander(f"🆕 What's new in v{__version__}"):
     st.markdown(
         "- **Working-interest / NRI net economics** + a **JIB partner-allocation** preview "
@@ -323,13 +331,13 @@ with tab_drafter:
             )
             try:
                 with st.spinner("Drafting AFE..."):
-                    markdown = run_drafter(diagnosis)
+                    markdown = run_drafter(diagnosis, api_key=byok_key or None)
                 st.markdown(markdown)
                 st.download_button("Download .md", markdown, file_name=f"AFE_{well_id}_{intervention}.md")
             except MissingAPIKey:
-                st.warning("Set `ANTHROPIC_API_KEY` to draft the AFE narrative. Everything else on "
-                           "this page — cost tables, tangible/intangible split, net economics, "
-                           "price deck, and Monte-Carlo — works without a key.")
+                st.warning("Enter your **Anthropic API key** in the sidebar to draft the AFE narrative. "
+                           "Everything else on this page — cost tables, tangible/intangible split, net "
+                           "economics, price deck, and Monte-Carlo — works without a key.")
 
 # ------------ Variance tab --------------------------------------------------
 with tab_variance:
