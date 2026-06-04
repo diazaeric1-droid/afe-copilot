@@ -19,7 +19,13 @@ import streamlit as st
 from src import __version__
 from src.cost_db import COST_TEMPLATES, benchmark_summary, total_estimate
 from src.drafter import AFEDiagnosis, run_drafter
-from src.economics import simulate_economics
+try:
+    from src.economics import simulate_economics
+    _MC_AVAILABLE = True
+except Exception as _mc_err:  # never let an optional analytics import take down the app
+    simulate_economics = None
+    _MC_AVAILABLE = False
+    _MC_IMPORT_ERROR = repr(_mc_err)
 from src.models import AFEDiagnosis as AFEDiagnosisModel
 from src.tracker import AFETracker, seed_demo_data
 
@@ -175,7 +181,10 @@ with tab_drafter:
         "and realized price (~$12 sd). Treatment cost is the benchmark estimate for "
         "the selected intervention."
     )
-    if st.button("Run Monte-Carlo NPV"):
+    if not _MC_AVAILABLE:
+        st.info("Probabilistic economics is temporarily unavailable in this build; "
+                "the rest of the app is unaffected.")
+    elif st.button("Run Monte-Carlo NPV"):
         if incremental_rate <= 0:
             st.error("Incremental uplift must be greater than 0 to run economics.")
         else:
