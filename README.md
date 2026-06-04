@@ -24,16 +24,16 @@ This system attacks all three bottlenecks: drafting speed, drafting quality, and
 Input: well diagnosis + intervention choice (e.g., "ESP swap + acid stim on well ED-001H").
 Output: a polished .docx AFE with:
 - Scope of work and technical justification
-- Line-item cost breakdown (equipment, vendors, manpower) benchmarked against historical cost DB
-- Pre-job and post-job economics (NPV @ 10%, payout, $/BOE)
+- Line-item cost breakdown benchmarked against the cost DB, split **tangible (capex) vs. intangible (IDC)** for the tax view
+- Economics with a **true effective-10% discount**, plus **working-interest / NRI net NPV**, a **price-deck sensitivity** strip, and a **JIB partner-allocation** preview
 - Risk register with mitigation actions
-- Approval signature block routed for the operator's typical chain
+- Approval signature block, with the AFE auto-routed to the **required approver** by delegation-of-authority $ limits
 
 **2. AFE Pipeline Tracker**
-Live dashboard showing every in-flight AFE with status (draft → engineering review → finance → approved → executed), aging in days, and predicted next-bottleneck (e.g., "this AFE will sit with finance for 8 days based on historical patterns — escalate early").
+Live dashboard showing every in-flight AFE with status (draft → engineering review → finance → approved → executed), aging in days, predicted next-bottleneck, the **required approver** for its $ value, and an **immutable audit trail** of every status change.
 
 **3. Variance Analyzer**
-Post-execution: ingest the actual rig invoices and field tickets. Computes actual-vs-AFE variance by category. Flags systematic over-runs by vendor, rig, or intervention type so the next AFE includes a more realistic estimate.
+Post-execution: ingest actuals and compute actual-vs-AFE variance by category — ranked by **$ overrun** (so 100%-unbudgeted lines are surfaced, not hidden), with **AFE-supplement flags** when an AFE overruns the policy threshold (>10%).
 
 **See a real sample:** [`examples/sample_afe_acid_stimulation.md`](examples/sample_afe_acid_stimulation.md) — a complete agent-generated AFE for a synthetic Delaware Basin acid stimulation, including scope, technical justification, cost breakdown with vendor benchmarks, NPV/payout, and a 7-line risk register (5 standard + 2 well-specific).
 
@@ -81,14 +81,24 @@ streamlit run demo/app.py
 
 - [x] v0.1 — AFE Drafter agent producing valid .docx
 - [x] v0.2 — Cost DB with historical benchmarks (synthetic)
-- [ ] v0.3 — Pipeline Tracker with status state machine + Streamlit dashboard
-- [ ] v0.4 — Variance Analyzer (actual-vs-AFE) with rig/vendor breakdown
-- [ ] v0.5 — Integration hook for Project 1 (well review → AFE draft is one chain)
+- [x] v0.3 — Pipeline Tracker + Streamlit dashboard; Monte-Carlo economics; validated chain from Project 1
+- [x] v0.4 — Variance Analyzer wired in (unbudgeted + supplement flags); WI/NRI net economics + JIB; tangible/intangible (IDC) split; authority-limit routing; immutable audit trail; effective-10% discount fix
+- [ ] v0.5 — Real cost-DB backend (SAP/Quorum/Oracle) replacing synthetic benchmarks; offset-AFE percentile comparison
 - [ ] v0.6 — Routing prediction model: which AFEs will bottleneck where, by historical pattern
 
 ## Why this matters for the AI-engineering hiring conversation
 
 This isn't a toy. It addresses a problem hiring managers have explicitly flagged as a gap they can't fill — production engineers who can scale beyond what a single human can write in a week. Combined with the Production Engineer Copilot, it's a complete end-to-end workflow: well diagnosis → intervention selection → AFE draft → approval tracking → variance analysis.
+
+## Part of a multi-agent pipeline
+
+This is the **authorize** stage of a detect → predict → authorize chain: the
+[Daily Production Digest](../daily-production-digest) flags a pump-failure signature,
+the [ESP Failure-Risk Agent](../esp-failure-risk-agent) scores it and emits a diagnosis,
+and this app drafts the AFE. `python -m src.handoff --input diagnosis.json` renders a
+complete, decision-ready AFE **deterministically** (no API key) — cost split, net
+economics, risk register, authority routing — or `--llm` for the Claude narrative. See
+[`../pe-pipeline/PIPELINE.md`](../pe-pipeline/PIPELINE.md); run the whole chain with `python3 ../pe-pipeline/pe_chain.py`.
 
 ## License
 

@@ -34,10 +34,26 @@ class LineItem:
     qty: float
     unit_cost_usd: float
     vendor: str | None = None
+    cost_class: Literal["tangible", "intangible"] = "intangible"
 
     @property
     def total_usd(self) -> float:
         return self.qty * self.unit_cost_usd
+
+
+# Categories that are CAPITALIZED equipment (tangible) for tax/AFE purposes; the
+# rest are intangible drilling/workover costs (IDC: rig days, services, labor,
+# chemicals, supervision) — currently expensed, where tangibles are depreciated.
+# Every real AFE shows this split, so finance can model the tax treatment.
+TANGIBLE_CATEGORIES: set[str] = {
+    "ESP unit", "ESP cable", "VSD + transformer", "Beam pumping unit", "Rod string",
+    "Downhole pump", "Surface motor + VFD", "Foundation + pad", "Gas lift valves",
+    "Replacement rods", "Wireline plunger",
+}
+
+
+def classify_cost_class(category: str) -> str:
+    return "tangible" if category in TANGIBLE_CATEGORIES else "intangible"
 
 
 # Reference DIRECT-cost line-item templates per intervention (contingency added
@@ -135,16 +151,46 @@ def _contingency_line(intervention: InterventionType, direct_items: list[LineIte
 
 
 def lookup_cost_template(intervention: InterventionType) -> list[LineItem]:
-    """Return the canonical line-item list (direct lines + computed contingency)."""
+    """Return the canonical line-item list (direct lines + computed contingency),
+    each tagged tangible/intangible for the AFE cost-class rollup."""
     if intervention not in COST_TEMPLATES:
         raise ValueError(f"Unknown intervention: {intervention}. "
                          f"Known: {list(COST_TEMPLATES)}")
-    direct = [LineItem(**item.__dict__) for item in COST_TEMPLATES[intervention]]
+    direct = []
+    for item in COST_TEMPLATES[intervention]:
+        li = LineItem(**item.__dict__)
+        li.cost_class = classify_cost_class(li.category)
+        direct.append(li)
     return direct + [_contingency_line(intervention, direct)]
 
 
 def total_estimate(intervention: InterventionType) -> float:
     return sum(item.total_usd for item in lookup_cost_template(intervention))
+
+
+def cost_rollup(intervention: InterventionType) -> dict[str, float]:
+    """Direct / contingency / total plus the tangible-vs-intangible (IDC) split.
+
+    Contingency inherits the tangible:intangible *ratio* of the direct cost so the
+    two subtotals still add to the grand total.
+    """
+    items = lookup_cost_template(intervention)
+    direct_items = [i for i in items if i.category != "Contingency"]
+    contingency = sum(i.total_usd for i in items if i.category == "Contingency")
+    direct = sum(i.total_usd for i in direct_items)
+    tangible_direct = sum(i.total_usd for i in direct_items if i.cost_class == "tangible")
+    intangible_direct = direct - tangible_direct
+    # Spread contingency across the two classes in proportion to direct cost.
+    t_frac = (tangible_direct / direct) if direct else 0.0
+    tangible = tangible_direct + contingency * t_frac
+    intangible = intangible_direct + contingency * (1 - t_frac)
+    return {
+        "direct": direct,
+        "contingency": contingency,
+        "total": direct + contingency,
+        "tangible": tangible,
+        "intangible": intangible,
+    }
 
 
 def benchmark_summary() -> dict[str, float]:

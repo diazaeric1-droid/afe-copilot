@@ -13,7 +13,6 @@ from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from rich.console import Console
 
@@ -21,6 +20,12 @@ from .cost_db import COST_TEMPLATES, lookup_cost_template, total_estimate
 from .economics import compute_economics
 from .models import AFEDiagnosis  # dataclass lives in models.py (no anthropic dependency)
 from .risk_register import lookup_risks
+
+
+class MissingAPIKey(RuntimeError):
+    """Raised when drafting is attempted without ANTHROPIC_API_KEY set. The cost,
+    economics, and risk tools (and Monte-Carlo / .docx) all work without a key —
+    only the LLM narrative needs one."""
 
 
 # ---------- tool schemas (Anthropic tool-use API) ----------------------------
@@ -80,8 +85,21 @@ class ToolExecutor:
         return [{**asdict(i), "total_usd": i.total_usd} for i in items]
 
     def _tool_compute_economics(self, **kwargs) -> dict:
+        # P&A / pure-cost jobs have no production uplift — production economics
+        # (NPV, payout, $/bbl) are meaningless and would render as $inf/bbl. Return
+        # a structured note so the model frames it as abandonment cost vs. liability.
+        rate = kwargs.get("incremental_rate_bopd", 0) or 0
+        if rate <= 0:
+            return {
+                "applicable": False,
+                "note": ("No production uplift — this is a cost-only / P&A job. Do NOT "
+                         "report NPV, payout, or $/bbl. Justify against remaining "
+                         "liability, plugging-bond release, and avoided idle-well carrying "
+                         "cost / regulatory exposure instead."),
+                "treatment_cost_usd": kwargs.get("treatment_cost_usd"),
+            }
         econ = compute_economics(**kwargs)
-        return asdict(econ)
+        return {"applicable": True, **asdict(econ)}
 
     def _tool_lookup_risks(self, intervention: str) -> list[dict]:
         return [asdict(r) for r in lookup_risks(intervention)]
@@ -95,7 +113,7 @@ Today's date: {today}
 
 Process:
 1. Call `lookup_cost_template` for the intervention to get baseline line-item costs.
-2. Call `compute_economics` using the line-item total as treatment_cost and the diagnosis's expected uplift.
+2. Call `compute_economics` using the line-item total as treatment_cost and the diagnosis's expected uplift. If the tool returns `"applicable": false` (a P&A or cost-only job), do NOT report NPV/payout/$ per bbl — justify the spend against remaining liability, plugging-bond release, and avoided idle-well carrying cost instead, and label the Economics section "Cost & Liability Basis".
 3. Call `lookup_risks` for the intervention.
 4. Write a complete AFE markdown document with these sections, in this order:
 
@@ -120,7 +138,13 @@ Style:
 
 def run_drafter(diagnosis: AFEDiagnosis, model: str = "claude-sonnet-4-6", verbose: bool = False) -> str:
     load_dotenv()
-    client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise MissingAPIKey(
+            "ANTHROPIC_API_KEY is not set — set it to draft the AFE narrative. "
+            "Cost tables, Monte-Carlo economics, and .docx export work without a key.")
+    from anthropic import Anthropic
+    client = Anthropic(api_key=key)
     console = Console()
     executor = ToolExecutor(diagnosis)
 

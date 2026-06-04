@@ -15,6 +15,12 @@ class AFEEconomics:
     npv_10pct_usd: float
     payout_months: float
     dollars_per_incremental_bbl: float
+    # Working-interest / net-revenue-interest view (operator's share). When WI=NRI=1
+    # these equal the gross figures above.
+    working_interest: float = 1.0
+    net_revenue_interest: float = 1.0
+    net_cost_to_operator_usd: float = 0.0
+    net_npv_10pct_usd: float = 0.0
 
 
 def compute_economics(
@@ -25,6 +31,8 @@ def compute_economics(
     realized_price_per_bbl: float = 65.0,
     opex_per_bbl: float = 12.0,
     discount_rate: float = 0.10,
+    working_interest: float = 1.0,
+    net_revenue_interest: float = 1.0,
 ) -> AFEEconomics:
     days_per_month = 365.25 / 12  # avoid the 360-day-year undercount
     months = np.arange(1, horizon_years * 12 + 1)
@@ -32,7 +40,9 @@ def compute_economics(
     monthly_vol = monthly_rate * days_per_month
     margin_per_bbl = realized_price_per_bbl - opex_per_bbl
     monthly_revenue = monthly_vol * margin_per_bbl
-    discount_factors = (1 + discount_rate / 12) ** months
+    # TRUE effective-annual discounting: a 10% input means 10% per YEAR, so the
+    # monthly factor is (1+r)^(m/12), not (1+r/12)^m (which is 10.47% effective).
+    discount_factors = (1 + discount_rate) ** (months / 12)
     npv = float(np.sum(monthly_revenue / discount_factors) - treatment_cost_usd)
 
     # cumulative[i] is cumulative net revenue at the END of month i+1, so the
@@ -45,6 +55,10 @@ def compute_economics(
     eur = float(monthly_vol.sum())
     dollars_per_bbl = treatment_cost_usd / first_year_bbl if first_year_bbl > 0 else float("inf")
 
+    # Operator's net position: it bears WI% of the cost and keeps NRI% of revenue.
+    net_cost = treatment_cost_usd * working_interest
+    net_npv = float(np.sum(monthly_revenue * net_revenue_interest / discount_factors) - net_cost)
+
     return AFEEconomics(
         treatment_cost_usd=treatment_cost_usd,
         incremental_first_year_bbl=first_year_bbl,
@@ -52,7 +66,49 @@ def compute_economics(
         npv_10pct_usd=npv,
         payout_months=payout_months,
         dollars_per_incremental_bbl=dollars_per_bbl,
+        working_interest=working_interest,
+        net_revenue_interest=net_revenue_interest,
+        net_cost_to_operator_usd=net_cost,
+        net_npv_10pct_usd=net_npv,
     )
+
+
+def price_sensitivity(
+    treatment_cost_usd: float,
+    incremental_rate_bopd: float,
+    prices: tuple[float, ...] = (45.0, 55.0, 65.0, 75.0, 85.0),
+    **kwargs,
+) -> list[dict]:
+    """NPV / payout across a realized-price deck — the price-strip row a VP asks for.
+
+    Returns one row per price with NPV, payout months, and $/bbl, holding the rest
+    of the assumptions fixed. ``kwargs`` pass through to ``compute_economics`` (decline,
+    opex, WI/NRI, etc.).
+    """
+    rows = []
+    for p in prices:
+        e = compute_economics(treatment_cost_usd, incremental_rate_bopd,
+                              realized_price_per_bbl=p, **kwargs)
+        rows.append({
+            "realized_price": p,
+            "npv_usd": e.npv_10pct_usd,
+            "net_npv_usd": e.net_npv_10pct_usd,
+            "payout_months": e.payout_months,
+            "dollars_per_bbl": e.dollars_per_incremental_bbl,
+        })
+    return rows
+
+
+def jib_split(gross_cost_usd: float, partners: dict[str, float]) -> list[dict]:
+    """Joint-Interest-Billing preview: allocate a gross AFE cost across partners by
+    working interest. ``partners`` maps name -> WI fraction (should sum to ~1.0)."""
+    total_wi = sum(partners.values()) or 1.0
+    return [
+        {"partner": name, "working_interest": wi,
+         "net_cost_usd": gross_cost_usd * wi,
+         "share_of_afe_pct": 100.0 * wi / total_wi}
+        for name, wi in partners.items()
+    ]
 
 
 # ---------- Monte-Carlo NPV ---------------------------------------------------
@@ -95,7 +151,7 @@ def _npv_vectorized(
     monthly_vol = monthly_rate * days_per_month
     margin_per_bbl = price - opex_per_bbl                                # (n,1)
     monthly_revenue = monthly_vol * margin_per_bbl                       # (n,T)
-    discount_factors = (1 + discount_rate / 12) ** months               # (T,)
+    discount_factors = (1 + discount_rate) ** (months / 12)             # (T,) effective-annual
     npv = np.sum(monthly_revenue / discount_factors, axis=1) - treatment_cost_usd
     return npv  # (n,)
 
@@ -119,7 +175,7 @@ def _payout_within(
     monthly_vol = rate * np.exp(-decline * (months[None, :] / 12)) * days_per_month
     monthly_revenue = monthly_vol * (price - opex_per_bbl)
     cumulative = np.cumsum(monthly_revenue, axis=1)             # (n,T)
-    cap = min(months_cap, len(months))
+    cap = max(1, min(months_cap, len(months)))   # guard months_cap <= 0
     # recovered within cap months if cumulative at month `cap` >= cost
     return cumulative[:, cap - 1] >= treatment_cost_usd
 
