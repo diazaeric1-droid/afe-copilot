@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 # Ensure repo root is on sys.path so `src.*` imports work on Streamlit Cloud
@@ -27,8 +28,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+import theme
 from src import __version__
-from src.cost_db import COST_TEMPLATES, benchmark_summary, cost_rollup, total_estimate
+from src.cost_db import (
+    COST_TEMPLATES, benchmark_summary, cost_rollup, lookup_cost_template, total_estimate)
 from src.drafter import AFEDiagnosis, MissingAPIKey, run_drafter
 try:
     from src.economics import jib_split, price_sensitivity, simulate_economics
@@ -44,20 +47,14 @@ from src.tracker import AFETracker, seed_demo_data
 from src.variance import analyze_variance, demo_variance_data
 
 
-st.set_page_config(page_title="AFE Copilot", page_icon="📝", layout="wide")
+theme.setup_page("AFE Copilot", icon="📝")
+theme.suite_nav("afe")
 
-_title_col, _badge_col = st.columns([0.8, 0.2])
-with _title_col:
-    st.title("AFE Copilot")
-with _badge_col:
-    st.markdown(
-        f"<div style='text-align:right;margin-top:1.5rem;'>"
-        f"<span style='background:#1F3A5F;color:#fff;padding:3px 10px;"
-        f"border-radius:12px;font-size:0.85rem;font-weight:600;'>v{__version__}</span>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-st.caption("Draft, track, and analyze AFEs — built for multi-rig E&P operators.")
+theme.header(
+    "AFE Copilot",
+    subtitle="Draft, track, and analyze AFEs — built for multi-rig E&P operators.",
+    chips=[(f"v{__version__}", "ver")],
+)
 
 with st.sidebar:
     st.header("AI drafting")
@@ -69,16 +66,12 @@ with st.sidebar:
 
 with st.expander(f"🆕 What's new in v{__version__}"):
     st.markdown(
-        "- **Working-interest / NRI net economics** + a **JIB partner-allocation** preview "
-        "(NPV was implicitly assuming 100% WI/NRI — now you see the operator's net position)\n"
-        "- **Tangible vs. intangible (IDC) cost split** on every estimate (the tax view finance asks for)\n"
-        "- **Authority-limit approval routing** ($ value → required approver) + **AFE-supplement** "
-        "flagging when actuals overrun the policy threshold\n"
-        "- **Variance analyzer wired into the app** (the advertised feature is now a tab) — "
-        "and it no longer hides 100%-unbudgeted overruns\n"
-        "- **Price-deck sensitivity** ($/bbl strip) and a **true effective-10% discount** "
-        "(was 10.47% from monthly compounding)\n"
-        "- **Immutable audit trail** of every status change; graceful no-API-key behavior"
+        "- **Unified dark + navy suite theme** and a **cross-app sidebar suite navigator** — "
+        "consistent look with one-click hopping across the PE app suite\n"
+        "- **One-click AFE export to Word (.docx)** in the Draft tab (alongside the existing .md)\n"
+        "- **Cost waterfall chart** — direct line items → contingency → total\n"
+        "- **Shared fleet registry**: Permian field/formation identity is consistent across the suite\n"
+        "- Swept the deprecated `use_container_width` (→ `width=\"stretch\"`); now needs streamlit>=1.50"
     )
 
 DB_PATH = Path("pipeline.sqlite")
@@ -110,15 +103,15 @@ with tab_pipeline:
         status_counts.columns = ["status", "count"]
         fig = px.bar(status_counts, x="status", y="count",
                      color="status", text="count")
-        fig.update_layout(showlegend=False, height=300, margin=dict(l=0, r=0, t=20, b=0))
-        st.plotly_chart(fig, use_container_width=True)
+        fig.update_layout(showlegend=False)
+        st.plotly_chart(theme.style_fig(fig, height=320), width="stretch")
 
         st.subheader("Active AFEs")
         show = df[["afe_number", "well_id", "intervention", "rig_name",
                    "total_cost_usd", "status", "days_in_status", "bottleneck_risk",
                    "required_approver"]].copy()
         show["total_cost_usd"] = show["total_cost_usd"].apply(lambda c: f"${c:,.0f}")
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.dataframe(show, width="stretch", hide_index=True)
         st.caption("`required_approver` is the delegation-of-authority level the AFE's $ value "
                    "needs (PE < $50k · Eng Mgr < $250k · Ops Mgr < $1MM · VP above).")
 
@@ -128,7 +121,7 @@ with tab_pipeline:
                 st.caption("No events recorded yet.")
             else:
                 st.dataframe(ev[["ts", "afe_number", "from_status", "to_status", "actor", "note"]],
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
 
 # ------------ Drafter tab ---------------------------------------------------
 with tab_drafter:
@@ -221,6 +214,30 @@ with tab_drafter:
     gc2.metric("Tangible (capitalized)", f"${rollup['tangible']:,.0f}")
     gc3.metric("Intangible (IDC)", f"${rollup['intangible']:,.0f}")
 
+    # ---- Cost waterfall: direct line items → contingency → total AFE --------
+    _wf_items = lookup_cost_template(intervention)
+    _direct = [li for li in _wf_items if li.category != "Contingency"]
+    _contingency = sum(li.total_usd for li in _wf_items if li.category == "Contingency")
+    _wf_labels = [li.category for li in _direct] + ["Contingency", "Total AFE cost"]
+    _wf_measures = ["relative"] * (len(_direct) + 1) + ["total"]
+    _wf_values = [li.total_usd for li in _direct] + [_contingency, 0]
+    fig_wf = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=_wf_measures,
+        x=_wf_labels,
+        y=_wf_values,
+        text=[f"${v:,.0f}" for v in _wf_values[:-1]] + [f"${rollup['total']:,.0f}"],
+        textposition="outside",
+        connector={"line": {"color": theme.GRID}},
+        increasing={"marker": {"color": theme.BLUE}},
+        decreasing={"marker": {"color": theme.RED}},
+        totals={"marker": {"color": theme.NAVY}},
+        hovertemplate="%{x}: $%{y:,.0f}<extra></extra>",
+    ))
+    fig_wf.update_layout(title="Cost waterfall — line items → contingency → total AFE",
+                         yaxis_title="USD")
+    st.plotly_chart(theme.style_fig(fig_wf, height=360, legend=False), width="stretch")
+
     wc1, wc2, wc3 = st.columns(3)
     working_interest = wc1.number_input("Working interest (WI)", 0.0, 1.0, 1.0, 0.05,
                                         help="Operator's share of COST.")
@@ -252,7 +269,7 @@ with tab_drafter:
                    lambda v: f"{v:.0f}" if v != float('inf') else "—")})
         st.caption("Price-deck sensitivity (NPV at a fixed rate across a realized-price strip):")
         st.dataframe(deck_df[["Realized $/bbl", "Gross NPV", "Net NPV", "Payout (mo)"]],
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
 
         if working_interest < 1.0:
             partners = {"Operator (you)": working_interest,
@@ -262,7 +279,7 @@ with tab_drafter:
             jib["working_interest"] = jib["working_interest"].map(lambda v: f"{v:.0%}")
             st.caption("JIB cost allocation (gross AFE billed by working interest):")
             st.dataframe(jib[["partner", "working_interest", "net_cost_usd"]],
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
 
     # ---- Monte-Carlo economics (pure numpy — no API key needed) -------------
     st.markdown("---")
@@ -300,23 +317,22 @@ with tab_drafter:
             fig_t = go.Figure()
             fig_t.add_trace(go.Bar(
                 y=labels, x=[base - lo for lo in lows], base=lows,
-                orientation="h", name="downside", marker_color="#C0504D",
+                orientation="h", name="downside", marker_color=theme.RED,
                 hovertemplate="low NPV: $%{base:,.0f}<extra></extra>",
             ))
             fig_t.add_trace(go.Bar(
                 y=labels, x=[hi - base for hi in highs], base=base,
-                orientation="h", name="upside", marker_color="#4F81BD",
+                orientation="h", name="upside", marker_color=theme.BLUE,
                 hovertemplate="high NPV: $%{x:,.0f}<extra></extra>",
             ))
-            fig_t.add_vline(x=base, line_dash="dash", line_color="#1F3A5F",
+            fig_t.add_vline(x=base, line_dash="dash", line_color=theme.NAVY,
                             annotation_text=f"base ${base/1e6:,.2f}M")
             fig_t.update_layout(
-                barmode="overlay", height=300, showlegend=True,
-                margin=dict(l=0, r=0, t=20, b=0),
+                barmode="overlay", showlegend=True,
                 xaxis_title="NPV @ 10% (USD)",
                 title="Tornado — NPV swing per variable",
             )
-            st.plotly_chart(fig_t, use_container_width=True)
+            st.plotly_chart(theme.style_fig(fig_t, height=320), width="stretch")
 
     if st.button("Draft AFE", type="primary"):
         if not well_id or not diagnosis_text:
@@ -333,7 +349,20 @@ with tab_drafter:
                 with st.spinner("Drafting AFE..."):
                     markdown = run_drafter(diagnosis, api_key=byok_key or None)
                 st.markdown(markdown)
-                st.download_button("Download .md", markdown, file_name=f"AFE_{well_id}_{intervention}.md")
+                dl_md, dl_docx = st.columns(2)
+                dl_md.download_button(
+                    "Download .md", markdown,
+                    file_name=f"AFE_{well_id}_{intervention}.md")
+                # Render the polished .docx (build_docx writes to a path → read bytes).
+                from src.docx_builder import build_docx
+                with tempfile.TemporaryDirectory() as _td:
+                    _docx_path = build_docx(
+                        markdown, Path(_td) / f"AFE_{well_id}_{intervention}.docx", diagnosis)
+                    _docx_bytes = _docx_path.read_bytes()
+                dl_docx.download_button(
+                    "Download AFE (.docx)", _docx_bytes,
+                    file_name=f"AFE_{well_id}_{intervention}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
             except MissingAPIKey:
                 st.warning("Enter your **Anthropic API key** in the sidebar to draft the AFE narrative. "
                            "Everything else on this page — cost tables, tangible/intangible split, net "
@@ -371,7 +400,7 @@ with tab_variance:
     for c in ("line_total_usd", "actual_usd", "variance_usd"):
         disp[c] = disp[c].apply(lambda v: f"${v:,.0f}")
     disp.columns = ["AFE", "Category", "AFE budget", "Actual", "Variance"]
-    st.dataframe(disp, use_container_width=True, hide_index=True)
+    st.dataframe(disp, width="stretch", hide_index=True)
 
 # ------------ Benchmarks tab ------------------------------------------------
 with tab_benchmarks:
@@ -385,6 +414,6 @@ with tab_benchmarks:
     for c in ("total_usd", "tangible_usd", "intangible_usd"):
         bench_df[c] = bench_df[c].apply(lambda v: f"${v:,.0f}")
     bench_df.columns = ["Intervention", "Total", "Tangible (capex)", "Intangible (IDC)"]
-    st.dataframe(bench_df, use_container_width=True, hide_index=True)
+    st.dataframe(bench_df, width="stretch", hide_index=True)
     st.caption("Tangible = capitalized equipment (depreciated); Intangible = IDC "
                "(rig, services, labor, chemicals — currently expensed).")

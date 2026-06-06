@@ -5,6 +5,21 @@ All notable changes to AFE Copilot are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-06-06
+
+### Added
+- **Unified dark + navy suite theme** with a **cross-app sidebar suite navigator** — consistent
+  look and one-click hopping across the upstream-PE app suite.
+- **One-click AFE export to Word (.docx)** wired into the Draft tab, alongside the existing
+  Markdown (.md) download.
+- **Cost waterfall chart** visualizing the build-up from direct line items → contingency → total.
+- **Shared fleet registry**: Permian field / formation identity is now consistent across the
+  whole suite.
+
+### Changed
+- Swept the deprecated `use_container_width` argument (→ `width="stretch"`); requires
+  `streamlit>=1.50`.
+
 ## [0.4.0] — 2026-06-03
 
 ### Added
