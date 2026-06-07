@@ -172,7 +172,7 @@ def _cost_waterfall(intervention: str, total: float) -> go.Figure:
         totals={"marker": {"color": theme.NAVY}},
         hovertemplate="%{x}: $%{y:,.0f}<extra></extra>",
     ))
-    fig_wf.update_layout(title="Cost waterfall — line items → contingency → total AFE",
+    fig_wf.update_layout(title="Cost Waterfall — Line Items → Contingency → Total AFE",
                          yaxis_title="USD")
     return theme.style_fig(fig_wf, height=360, legend=False)
 
@@ -199,7 +199,7 @@ def _tornado_fig(mc) -> go.Figure:
                     annotation_text=f"base ${base/1e6:,.2f}M")
     fig_t.update_layout(barmode="overlay", showlegend=True,
                         xaxis_title="NPV @ 10% (USD)",
-                        title="Tornado — NPV swing per variable")
+                        title="Tornado — NPV Swing Per Variable")
     return theme.style_fig(fig_t, height=320)
 
 
@@ -217,7 +217,27 @@ def render_overview() -> None:
     )
     theme.data_badge("synthetic", "Illustrative AFE cost templates + pipeline tracker — cost/authority data is never public.")
 
-    with st.expander(f"🆕 What's new in v{__version__}"):
+    theme.how_to(
+        "- An **AFE (Authorization For Expenditure)** is the capital-approval document an "
+        "operator signs before spending on a well job — it states the scope, the cost "
+        "breakdown, and the expected economics so the right authority level can approve it.\n"
+        "- **Draft New AFE** turns a well diagnosis (typed in, loaded from an example, or "
+        "chained from the Production Engineer Copilot) into a costed AFE: a benchmark cost "
+        "table, tangible/intangible (IDC) split, **net NPV** to the operator (working-"
+        "interest cost share, NRI revenue share), a price-deck sensitivity strip, and a "
+        "Monte-Carlo P10/P50/P90 — all deterministic, no API key. Add your own Anthropic "
+        "key only to draft the AI-written narrative.\n"
+        "- **Routing** maps each AFE's dollar value to the required sign-off level "
+        "(delegation-of-authority limits: PE < $50k · Eng Mgr < $250k · Ops Mgr < $1MM · "
+        "VP above).\n"
+        "- The **AFE pipeline** tracks every in-flight AFE in a local SQLite store — gross "
+        "cost, net NPV, status, days-in-status, and an immutable audit trail. Open any AFE "
+        "from the **AFEs** section in the sidebar to drill in, and review closed-out jobs "
+        "in **Actual-vs-AFE variance** (a supplemental AFE is flagged when actuals run "
+        ">10% over)."
+    )
+
+    with st.expander(f"🆕 What's New in v{__version__}"):
         st.markdown(
             "- **Multipage explorer** — an Overview plus a **drill-down page per AFE** "
             "(`st.navigation`): each AFE's cost waterfall, net economics + tornado, risk "
@@ -275,7 +295,7 @@ def _overview_kpis(df: pd.DataFrame) -> None:
 
 
 def _overview_table(df: pd.DataFrame) -> None:
-    st.subheader("AFE pipeline")
+    st.subheader("AFE Pipeline")
     st.caption(
         "One row per AFE — sort any column. **Supplement?** flags an actual >10% over "
         "the AFE (a supplemental AFE is policy-required). Open an AFE from the **AFEs** "
@@ -312,6 +332,10 @@ def _overview_table(df: pd.DataFrame) -> None:
     )
     st.caption("`Required approver` is the delegation-of-authority level the AFE's $ value "
                "needs (PE < $50k · Eng Mgr < $250k · Ops Mgr < $1MM · VP above).")
+    theme.source_note(
+        "Net NPV (USD) = deterministic DCF at +100 BOPD base uplift, for cross-AFE ranking "
+        "only; gross cost (USD) from the AFE's benchmark cost template; variance = "
+        "actual − AFE budget (%).")
 
 
 def _net_npv_for(row) -> float | None:
@@ -334,7 +358,7 @@ def _net_npv_for(row) -> float | None:
 # =====================================================================
 
 def _drafter_panel() -> None:
-    st.subheader("Generate a new AFE")
+    st.subheader("Generate a New AFE")
     st.caption(
         "Cost tables, tangible/intangible split, net economics, price deck, and "
         "Monte-Carlo all work without a key. Enter your **own** Anthropic key below "
@@ -345,7 +369,7 @@ def _drafter_panel() -> None:
              "AI-written AFE narrative.")
 
     # ---- One-click chain from Production Engineer Copilot -------------------
-    with st.expander("🔗 Chain from Production Engineer Copilot (paste diagnosis JSON)"):
+    with st.expander("🔗 Chain From Production Engineer Copilot (Paste Diagnosis JSON)"):
         st.caption(
             "Paste a diagnosis exported by the Production Engineer Copilot (Project 1). "
             "It is validated before it can become an AFE — invalid fields are reported "
@@ -424,7 +448,7 @@ def _drafter_panel() -> None:
 
     # ---- Net economics & price deck (deterministic — no API key needed) -----
     st.markdown("---")
-    st.subheader("Net economics, price deck & partner split")
+    st.subheader("Net Economics, Price Deck & Partner Split")
     rollup = cost_rollup(intervention)
     gc1, gc2, gc3 = st.columns(3)
     gc1.metric("AFE total (gross)", f"${rollup['total']:,.0f}")
@@ -432,6 +456,9 @@ def _drafter_panel() -> None:
     gc3.metric("Intangible (IDC)", f"${rollup['intangible']:,.0f}")
 
     st.plotly_chart(_cost_waterfall(intervention, rollup["total"]), width="stretch")
+    theme.source_note(
+        "Benchmark cost template for the selected intervention; bars in USD, building "
+        "direct line items → contingency → total AFE.")
 
     wc1, wc2, wc3 = st.columns(3)
     working_interest = wc1.number_input("Working interest (WI)", 0.0, 1.0, 1.0, 0.05,
@@ -479,7 +506,7 @@ def _drafter_panel() -> None:
 
     # ---- Monte-Carlo economics (pure numpy — no API key needed) -------------
     st.markdown("---")
-    st.subheader("Probabilistic economics (Monte-Carlo, gross)")
+    st.subheader("Probabilistic Economics (Monte-Carlo, Gross)")
     st.caption(
         "10,000 trials over incremental rate (±30%), uplift decline (±0.15 abs), "
         "and realized price (~$12 sd). Treatment cost is the benchmark estimate for "
@@ -503,6 +530,11 @@ def _drafter_panel() -> None:
             m3.metric("P90 NPV (upside)", f"${mc.npv_p90_usd/1e6:,.2f}M")
             m4.metric("P(payout < 24 mo)", f"{mc.probability_of_payout*100:.0f}%")
             st.plotly_chart(_tornado_fig(mc), width="stretch")
+            theme.source_note(
+                "NPV @ 10% (USD) swing as each variable moves over its sampled range; "
+                "dashed line is the base-case NPV.")
+
+    theme.references(["npv"])
 
     if st.button("Draft AFE", type="primary"):
         if not well_id or not diagnosis_text:
@@ -539,7 +571,7 @@ def _drafter_panel() -> None:
 
 
 def _variance_panel() -> None:
-    st.subheader("Actual-vs-AFE variance (closed-out AFEs)")
+    st.subheader("Actual-vs-AFE Variance (Closed-Out AFEs)")
     st.caption("Demo actuals for two closed AFEs — including a 100%-unbudgeted 'Fishing' line "
                "and a rig overrun that trips the supplemental-AFE policy (>10%).")
     afe_df, actuals_df = demo_variance_data()
@@ -570,10 +602,14 @@ def _variance_panel() -> None:
         disp[c] = disp[c].apply(lambda v: f"${v:,.0f}")
     disp.columns = ["AFE", "Category", "AFE budget", "Actual", "Variance"]
     st.dataframe(disp, width="stretch", hide_index=True)
+    theme.source_note(
+        "Per-category variance (USD) = actual − AFE budget; rows sorted by largest "
+        "overrun. Supplemental AFE flags an overrun above the policy threshold "
+        f"(>{SUPPLEMENT_THRESHOLD_PCT:.0f}%).")
 
 
 def _benchmarks_panel() -> None:
-    st.subheader("Reference cost per intervention (synthetic Permian benchmarks)")
+    st.subheader("Reference Cost Per Intervention (Synthetic Permian Benchmarks)")
     rows = []
     for interv in COST_TEMPLATES:
         r = cost_rollup(interv)
@@ -637,14 +673,17 @@ def render_afe(afe_id: str) -> None:
         return
 
     # ---- cost waterfall -----------------------------------------------------
-    st.subheader("Cost breakdown")
+    st.subheader("Cost Breakdown")
     cc1, cc2, cc3 = st.columns(3)
     cc1.metric("AFE total (gross)", f"${rollup['total']:,.0f}")
     cc2.metric("Tangible (capitalized)", f"${rollup['tangible']:,.0f}")
     cc3.metric("Intangible (IDC)", f"${rollup['intangible']:,.0f}")
     st.plotly_chart(_cost_waterfall(intervention, rollup["total"]), width="stretch")
+    theme.source_note(
+        "Benchmark cost template for this intervention; bars in USD, building direct "
+        "line items → contingency → total AFE.")
 
-    with st.expander("Line-item detail"):
+    with st.expander("Line-Item Detail"):
         li = lookup_cost_template(intervention)
         li_df = pd.DataFrame([
             {"Category": x.category, "Description": x.description, "Qty": x.qty,
@@ -661,7 +700,7 @@ def render_afe(afe_id: str) -> None:
     _afe_economics(intervention, total)
 
     # ---- risk register ------------------------------------------------------
-    st.subheader("Risk register")
+    st.subheader("Risk Register")
     risks = lookup_risks(intervention)
     if risks:
         risk_df = pd.DataFrame([
@@ -685,7 +724,7 @@ def render_afe(afe_id: str) -> None:
 
 
 def _afe_economics(intervention: str, total: float) -> None:
-    st.subheader("Net economics")
+    st.subheader("Net Economics")
     if not _MC_AVAILABLE:
         st.info("Economics module unavailable in this build.")
         return
@@ -712,10 +751,14 @@ def _afe_economics(intervention: str, total: float) -> None:
     t3.metric("P90 NPV", f"${mc.npv_p90_usd/1e6:,.2f}M")
     t4.metric("P(payout < 24 mo)", f"{mc.probability_of_payout*100:.0f}%")
     st.plotly_chart(_tornado_fig(mc), width="stretch")
+    theme.source_note(
+        "NPV @ 10% (USD) swing as each variable moves over its sampled range; dashed "
+        "line is the base-case NPV.")
+    theme.references(["npv"])
 
 
 def _afe_routing(row, total: float) -> None:
-    st.subheader("Authority routing")
+    st.subheader("Authority Routing")
     approver = row["required_approver"]
     st.markdown(
         f"This **${total:,.0f}** AFE requires sign-off at the **{approver}** authority level.")
@@ -733,7 +776,7 @@ def _afe_routing(row, total: float) -> None:
 
 
 def _afe_audit(afe_id: str) -> None:
-    st.subheader("Status / audit trail")
+    st.subheader("Status / Audit Trail")
     token = st.session_state.get("_afe_cache_token", 0)
     ev = _events_df(str(DB_PATH), afe_id, token)
     if ev.empty:
@@ -746,7 +789,7 @@ def _afe_audit(afe_id: str) -> None:
 
 
 def _afe_variance(afe_id: str) -> None:
-    st.subheader("Actual-vs-AFE variance")
+    st.subheader("Actual-vs-AFE Variance")
     m = _variance_for(afe_id)
     if m is None:
         st.caption("No closed-out actuals recorded for this AFE yet.")
