@@ -215,6 +215,7 @@ def render_overview() -> None:
         chips=[(f"v{__version__}", "ver"), ("AFE pipeline", "info"),
                ("document agent", "info")],
     )
+    theme.data_badge("synthetic", "Illustrative AFE cost templates + pipeline tracker — cost/authority data is never public.")
 
     with st.expander(f"🆕 What's new in v{__version__}"):
         st.markdown(
