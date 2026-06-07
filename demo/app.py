@@ -1,16 +1,31 @@
-"""Streamlit demo: AFE pipeline dashboard + ad-hoc drafter."""
+"""Streamlit AFE Copilot — multipage fleet-overview + per-AFE drill-down.
+
+Multipage (``st.navigation`` + ``st.Page``): an **Overview** page (in-flight KPIs,
+a sortable AFE pipeline table, plus Draft / Variance / Cost-Benchmark tabs) and one
+**drill-down page per AFE** in the SQLite tracker (cost waterfall, net economics +
+tornado, risk register, authority routing, immutable audit trail, and actual-vs-AFE
+variance for that AFE).
+
+Deterministic end-to-end: every cost / economics / variance / docx feature runs with
+ZERO API key. LLM AFE-narrative drafting is BYOK-optional (key entered in the Draft
+tab body). Charts use ``theme.style_fig``.
+"""
 from __future__ import annotations
 
 import json
 import sys
 import tempfile
+from functools import partial
 from pathlib import Path
 
-# Ensure repo root is on sys.path so `src.*` imports work on Streamlit Cloud
-# (where the package isn't pip-installed, just the deps from requirements.txt).
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+# Ensure repo root is on sys.path so `src.*` imports work on Streamlit Cloud, and the
+# demo dir so the vendored `theme` / `fleet_registry` resolve regardless of cwd
+# (Streamlit adds the entrypoint dir at runtime; AppTest / other contexts may not).
+DEMO_DIR = Path(__file__).resolve().parent
+REPO_ROOT = DEMO_DIR.parent
+for _p in (str(REPO_ROOT), str(DEMO_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 # --- Self-heal stale bytecode / module cache (Streamlit Cloud) --------------
 # Streamlit reuses the container across redeploys; a cached .pyc or already-imported
@@ -28,10 +43,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+import fleet_registry
 import theme
 from src import __version__
 from src.cost_db import (
-    COST_TEMPLATES, benchmark_summary, cost_rollup, lookup_cost_template, total_estimate)
+    COST_TEMPLATES, cost_rollup, lookup_cost_template, total_estimate)
 from src.drafter import AFEDiagnosis, MissingAPIKey, run_drafter
 try:
     from src.economics import jib_split, price_sensitivity, simulate_economics
@@ -43,100 +59,300 @@ except Exception as _mc_err:  # never let an optional analytics import take down
     _MC_AVAILABLE = False
     _MC_IMPORT_ERROR = repr(_mc_err)
 from src.models import AFEDiagnosis as AFEDiagnosisModel
-from src.tracker import AFETracker, seed_demo_data
-from src.variance import analyze_variance, demo_variance_data
+from src.risk_register import lookup_risks
+from src.tracker import (
+    AFETracker, IN_FLIGHT_STATUSES, required_approver, seed_demo_data)
+from src.variance import (
+    SUPPLEMENT_THRESHOLD_PCT, analyze_variance, demo_variance_data)
 
 
-theme.setup_page("AFE Copilot", icon="📝")
-theme.suite_nav("afe")
+DB_PATH = REPO_ROOT / "pipeline.sqlite"
 
-theme.header(
-    "AFE Copilot",
-    subtitle="Draft, track, and analyze AFEs — built for multi-rig E&P operators.",
-    chips=[(f"v{__version__}", "ver")],
-)
 
-with st.sidebar:
-    st.header("AI drafting")
+# ---- cached loads ----------------------------------------------------------
+
+@st.cache_resource(show_spinner=False)
+def _get_tracker(db_path: str) -> AFETracker:
+    """Cached tracker handle.
+
+    Uses cache_resource (NOT cache_data) because it returns a custom ``AFETracker``
+    instance — Streamlit's cache_data serializer rejects custom classes on
+    Python 3.14 / newer Streamlit. The tracker only wraps a path + opens a short-lived
+    SQLite connection per call, so sharing it across sessions is safe."""
+    return AFETracker(db_path)
+
+
+@st.cache_data(show_spinner=False)
+def _pipeline_df(db_path: str, _cache_token: int) -> pd.DataFrame:
+    """The AFE pipeline as a plain DataFrame (cache_data-safe).
+
+    ``_cache_token`` lets the caller bust this cache after seeding/inserts without
+    touching the cached tracker resource."""
+    return _get_tracker(db_path).as_dataframe()
+
+
+@st.cache_data(show_spinner=False)
+def _events_df(db_path: str, afe_number: str, _cache_token: int) -> pd.DataFrame:
+    """Audit-trail events for one AFE as a plain DataFrame (cache_data-safe)."""
+    return _get_tracker(db_path).events(afe_number)
+
+
+@st.cache_data(show_spinner=False)
+def _variance_for(afe_number: str) -> pd.DataFrame | None:
+    """Per-AFE actual-vs-AFE line detail (plain DataFrame), or None if no actuals.
+
+    Reuses the deterministic demo variance dataset; returns the merged line-level
+    frame restricted to this AFE so the drill-down can render its own variance."""
+    afe_df, actuals_df = demo_variance_data()
+    if afe_number not in set(afe_df["afe_number"]) | set(actuals_df["afe_number"]):
+        return None
+    sub_afe = afe_df[afe_df["afe_number"] == afe_number]
+    sub_act = actuals_df[actuals_df["afe_number"] == afe_number]
+    merged = sub_afe.merge(sub_act, on=["afe_number", "category"], how="outer").fillna(0)
+    merged["variance_usd"] = merged["actual_usd"] - merged["line_total_usd"]
+    return merged.sort_values("variance_usd", ascending=False)
+
+
+def _variance_pct_for(afe_number: str) -> float | None:
+    """AFE-level actual-vs-budget % overrun for the pipeline table, or None."""
+    m = _variance_for(afe_number)
+    if m is None:
+        return None
+    budget = float(m["line_total_usd"].sum())
+    actual = float(m["actual_usd"].sum())
+    return ((actual - budget) / budget * 100.0) if budget else None
+
+
+def _bump_cache_token() -> int:
+    st.session_state["_afe_cache_token"] = st.session_state.get("_afe_cache_token", 0) + 1
+    return st.session_state["_afe_cache_token"]
+
+
+# ---- shared helpers --------------------------------------------------------
+
+def _back_to_overview() -> None:
+    target = globals().get("overview")
+    try:
+        st.page_link(target if target is not None else "app.py",
+                     label="← Back to AFE overview", icon="📋")
+    except Exception:
+        pass
+
+
+def _registry_meta(well_id: str):
+    """Return fleet_registry metadata ONLY for shared ``well_0NN`` ids; else None.
+
+    The tracker's demo wells use the ``ED-NNH`` convention, which is not part of the
+    shared fleet registry, so enrichment is conditional (the registry never raises,
+    but we only show it when the id actually follows the suite convention)."""
+    if isinstance(well_id, str) and well_id.startswith("well_"):
+        return fleet_registry.get(well_id)
+    return None
+
+
+def _cost_waterfall(intervention: str, total: float) -> go.Figure:
+    """Cost waterfall — direct line items → contingency → total AFE. (Logic preserved
+    byte-for-byte from the original Draft tab, just factored into a helper.)"""
+    _wf_items = lookup_cost_template(intervention)
+    _direct = [li for li in _wf_items if li.category != "Contingency"]
+    _contingency = sum(li.total_usd for li in _wf_items if li.category == "Contingency")
+    _wf_labels = [li.category for li in _direct] + ["Contingency", "Total AFE cost"]
+    _wf_measures = ["relative"] * (len(_direct) + 1) + ["total"]
+    _wf_values = [li.total_usd for li in _direct] + [_contingency, 0]
+    fig_wf = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=_wf_measures,
+        x=_wf_labels,
+        y=_wf_values,
+        text=[f"${v:,.0f}" for v in _wf_values[:-1]] + [f"${total:,.0f}"],
+        textposition="outside",
+        connector={"line": {"color": theme.GRID}},
+        increasing={"marker": {"color": theme.BLUE}},
+        decreasing={"marker": {"color": theme.RED}},
+        totals={"marker": {"color": theme.NAVY}},
+        hovertemplate="%{x}: $%{y:,.0f}<extra></extra>",
+    ))
+    fig_wf.update_layout(title="Cost waterfall — line items → contingency → total AFE",
+                         yaxis_title="USD")
+    return theme.style_fig(fig_wf, height=360, legend=False)
+
+
+def _tornado_fig(mc) -> go.Figure:
+    """Tornado — NPV swing per variable (logic preserved from the original Draft tab)."""
+    items = sorted(mc.tornado.items(), key=lambda kv: kv[1]["swing"])
+    labels = [k.replace("_", " ") for k, _ in items]
+    lows = [v["low"] for _, v in items]
+    highs = [v["high"] for _, v in items]
+    base = mc.base_npv_usd
+    fig_t = go.Figure()
+    fig_t.add_trace(go.Bar(
+        y=labels, x=[base - lo for lo in lows], base=lows,
+        orientation="h", name="downside", marker_color=theme.RED,
+        hovertemplate="low NPV: $%{base:,.0f}<extra></extra>",
+    ))
+    fig_t.add_trace(go.Bar(
+        y=labels, x=[hi - base for hi in highs], base=base,
+        orientation="h", name="upside", marker_color=theme.BLUE,
+        hovertemplate="high NPV: $%{x:,.0f}<extra></extra>",
+    ))
+    fig_t.add_vline(x=base, line_dash="dash", line_color=theme.NAVY,
+                    annotation_text=f"base ${base/1e6:,.2f}M")
+    fig_t.update_layout(barmode="overlay", showlegend=True,
+                        xaxis_title="NPV @ 10% (USD)",
+                        title="Tornado — NPV swing per variable")
+    return theme.style_fig(fig_t, height=320)
+
+
+# =====================================================================
+# PAGE: Overview
+# =====================================================================
+
+def render_overview() -> None:
+    theme.header(
+        "AFE Copilot",
+        subtitle="Draft, track, and analyze AFEs — built for multi-rig E&P operators. "
+                 "Deterministic cost / economics / variance; LLM narrative is BYOK-optional.",
+        chips=[(f"v{__version__}", "ver"), ("AFE pipeline", "info"),
+               ("document agent", "info")],
+    )
+
+    with st.expander(f"🆕 What's new in v{__version__}"):
+        st.markdown(
+            "- **Multipage explorer** — an Overview plus a **drill-down page per AFE** "
+            "(`st.navigation`): each AFE's cost waterfall, net economics + tornado, risk "
+            "register, authority routing, immutable audit trail, and actual-vs-AFE variance.\n"
+            "- **Sortable AFE pipeline table** — one row per AFE (cost, net NPV, status, "
+            "required approver, days-in-status, supplement flag, variance) — sort any column, "
+            "then open the AFE from the **AFEs** section in the sidebar.\n"
+            "- **Unified dark + navy suite theme** + cross-app sidebar suite navigator.\n"
+            "- One-click AFE export to Word (.docx) and the cost waterfall retained in **Draft New AFE**.\n"
+            "- Shared **fleet registry** enrichment when an AFE references a suite `well_0NN` id."
+        )
+
+    token = st.session_state.get("_afe_cache_token", 0)
+    df = _pipeline_df(str(DB_PATH), token)
+
+    if df.empty:
+        st.info("No AFEs yet. Use the **Draft New AFE** tab below to create one.")
+    else:
+        _overview_kpis(df)
+        _overview_table(df)
+
+    st.divider()
+    tab_drafter, tab_variance, tab_benchmarks = st.tabs(
+        ["📝 Draft New AFE", "📊 Variance", "🏷️ Cost Benchmarks"])
+    with tab_drafter:
+        _drafter_panel()
+    with tab_variance:
+        _variance_panel()
+    with tab_benchmarks:
+        _benchmarks_panel()
+
+
+def _overview_kpis(df: pd.DataFrame) -> None:
+    in_flight_mask = df.status.isin(list(IN_FLIGHT_STATUSES))
+    # Count AFEs whose cost lands above the Production-Engineer authority limit
+    # (i.e. anything needing an Eng Mgr or higher sign-off).
+    over_pe_threshold = int((df["required_approver"] != "Production Engineer").sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("In-flight $", f"${df.loc[in_flight_mask, 'total_cost_usd'].sum() / 1e6:.1f}M",
+              help="Total cost of draft / engineering-review / finance-review AFEs "
+                   "(excludes executed + rejected).")
+    c2.metric("In-flight AFEs", int(in_flight_mask.sum()))
+    c3.metric("Approved (not executed)", int((df.status == "approved").sum()))
+    c4.metric("Above PE authority", over_pe_threshold,
+              help="AFEs whose $ value needs an Engineering Manager or higher sign-off.")
+
+    st.caption("**By status** · " + " · ".join(
+        f"{s.replace('_', ' ')}: {int((df.status == s).sum())}"
+        for s in ["draft", "engineering_review", "finance_review",
+                  "approved", "executed", "rejected"]))
+    st.caption("**By required approver** · " + " · ".join(
+        f"{role}: {int((df.required_approver == role).sum())}"
+        for role in df.required_approver.unique()))
+
+
+def _overview_table(df: pd.DataFrame) -> None:
+    st.subheader("AFE pipeline")
+    st.caption(
+        "One row per AFE — sort any column. **Supplement?** flags an actual >10% over "
+        "the AFE (a supplemental AFE is policy-required). Open an AFE from the **AFEs** "
+        "section in the sidebar to drill into its waterfall, economics, risks, and audit trail.")
+
+    rows = []
+    for _, r in df.iterrows():
+        afe_no = r["afe_number"]
+        try:
+            net_npv = _net_npv_for(r)
+        except Exception:
+            net_npv = None
+        var_pct = _variance_pct_for(afe_no)
+        supplement = (var_pct is not None and var_pct > SUPPLEMENT_THRESHOLD_PCT)
+        rows.append({
+            "AFE #": afe_no,
+            "Well/Project": r["well_id"],
+            "Intervention": r["intervention"],
+            "Gross cost $": float(r["total_cost_usd"]),
+            "Net NPV $": net_npv,
+            "Status": r["status"],
+            "Required approver": r["required_approver"],
+            "Days in status": int(r["days_in_status"]),
+            "Supplement?": "⚠️" if supplement else "",
+            "Variance vs actual": (f"{var_pct:+.0f}%" if var_pct is not None else "—"),
+        })
+    table = pd.DataFrame(rows)
+    st.dataframe(
+        table, width="stretch", hide_index=True,
+        column_config={
+            "Gross cost $": st.column_config.NumberColumn(format="$%,.0f"),
+            "Net NPV $": st.column_config.NumberColumn(format="$%,.0f"),
+        },
+    )
+    st.caption("`Required approver` is the delegation-of-authority level the AFE's $ value "
+               "needs (PE < $50k · Eng Mgr < $250k · Ops Mgr < $1MM · VP above).")
+
+
+def _net_npv_for(row) -> float | None:
+    """Deterministic net-NPV estimate for a tracker row using its intervention's
+    benchmark cost. Uses a nominal +100 BOPD uplift at base assumptions (the same
+    deterministic economics engine the Draft tab uses) — for ranking only, so the
+    table has a comparable economics column. None when economics is unavailable or
+    the intervention is cost-only (P&A)."""
+    if not _MC_AVAILABLE or row["intervention"] not in COST_TEMPLATES:
+        return None
+    if row["intervention"] == "p_and_a":
+        return None
+    from src.economics import compute_economics as _ce
+    net = _ce(float(row["total_cost_usd"]), 100.0)
+    return float(net.net_npv_10pct_usd)
+
+
+# =====================================================================
+# Overview tabs (Draft / Variance / Benchmarks) — logic preserved
+# =====================================================================
+
+def _drafter_panel() -> None:
+    st.subheader("Generate a new AFE")
+    st.caption(
+        "Cost tables, tangible/intangible split, net economics, price deck, and "
+        "Monte-Carlo all work without a key. Enter your **own** Anthropic key below "
+        "only to draft the AI-written AFE narrative (used for this session, never stored).")
     byok_key = st.text_input(
         "🔑 Anthropic API key (optional)", type="password",
         help="Bring your own key — used only for this session, never stored. Powers the "
-             "AI-written AFE narrative. Cost tables, tangible/intangible split, net economics, "
-             "price deck, variance, and Monte-Carlo all work without it.")
+             "AI-written AFE narrative.")
 
-with st.expander(f"🆕 What's new in v{__version__}"):
-    st.markdown(
-        "- **Unified dark + navy suite theme** and a **cross-app sidebar suite navigator** — "
-        "consistent look with one-click hopping across the PE app suite\n"
-        "- **One-click AFE export to Word (.docx)** in the Draft tab (alongside the existing .md)\n"
-        "- **Cost waterfall chart** — direct line items → contingency → total\n"
-        "- **Shared fleet registry**: Permian field/formation identity is consistent across the suite\n"
-        "- Swept the deprecated `use_container_width` (→ `width=\"stretch\"`); now needs streamlit>=1.50"
-    )
-
-DB_PATH = Path("pipeline.sqlite")
-if not DB_PATH.exists():
-    seed_demo_data(DB_PATH)
-
-tab_pipeline, tab_drafter, tab_variance, tab_benchmarks = st.tabs(
-    ["Pipeline", "Draft New AFE", "Variance", "Cost Benchmarks"])
-
-# ------------ Pipeline tab --------------------------------------------------
-with tab_pipeline:
-    df = AFETracker(DB_PATH).as_dataframe()
-    if df.empty:
-        st.info("No AFEs yet. Use the Draft tab.")
-    else:
-        in_flight_mask = df.status.isin(["draft", "engineering_review", "finance_review"])
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("In-flight AFEs", int(in_flight_mask.sum()))
-        col2.metric("Approved (not executed)", int((df.status == "approved").sum()))
-        col3.metric("HIGH bottleneck risk", int((df.bottleneck_risk == "HIGH").sum()))
-        # In-flight $ only — exclude executed (spent) and rejected (dead) AFEs.
-        col4.metric("In-flight $ (M)", f"${df.loc[in_flight_mask, 'total_cost_usd'].sum() / 1e6:.1f}M")
-
-        st.subheader("Pipeline status")
-        status_counts = df.status.value_counts().reindex(
-            ["draft", "engineering_review", "finance_review", "approved", "executed", "rejected"],
-            fill_value=0,
-        ).reset_index()
-        status_counts.columns = ["status", "count"]
-        fig = px.bar(status_counts, x="status", y="count",
-                     color="status", text="count")
-        fig.update_layout(showlegend=False)
-        st.plotly_chart(theme.style_fig(fig, height=320), width="stretch")
-
-        st.subheader("Active AFEs")
-        show = df[["afe_number", "well_id", "intervention", "rig_name",
-                   "total_cost_usd", "status", "days_in_status", "bottleneck_risk",
-                   "required_approver"]].copy()
-        show["total_cost_usd"] = show["total_cost_usd"].apply(lambda c: f"${c:,.0f}")
-        st.dataframe(show, width="stretch", hide_index=True)
-        st.caption("`required_approver` is the delegation-of-authority level the AFE's $ value "
-                   "needs (PE < $50k · Eng Mgr < $250k · Ops Mgr < $1MM · VP above).")
-
-        with st.expander("🧾 Audit trail (immutable status-change log)"):
-            ev = AFETracker(DB_PATH).events()
-            if ev.empty:
-                st.caption("No events recorded yet.")
-            else:
-                st.dataframe(ev[["ts", "afe_number", "from_status", "to_status", "actor", "note"]],
-                             width="stretch", hide_index=True)
-
-# ------------ Drafter tab ---------------------------------------------------
-with tab_drafter:
     # ---- One-click chain from Production Engineer Copilot -------------------
     with st.expander("🔗 Chain from Production Engineer Copilot (paste diagnosis JSON)"):
         st.caption(
             "Paste a diagnosis exported by the Production Engineer Copilot (Project 1). "
             "It is validated before it can become an AFE — invalid fields are reported "
-            "in plain English instead of a stack trace."
-        )
+            "in plain English instead of a stack trace.")
         pe_upload = st.file_uploader("Upload PE-Copilot diagnosis .json", type=["json"],
                                      key="pe_copilot_upload")
         pe_text = st.text_area("…or paste the diagnosis JSON here", height=160,
                                key="pe_copilot_text")
-
         if st.button("Validate & load into drafter", key="pe_copilot_load"):
             raw = None
             if pe_upload is not None:
@@ -171,13 +387,10 @@ with tab_drafter:
                         }
                         st.success(
                             f"Validated diagnosis for {diag.well_id} "
-                            f"({diag.intervention}). Fields loaded below."
-                        )
+                            f"({diag.intervention}). Fields loaded below.")
 
-    st.subheader("Generate a new AFE")
-    examples_dir = Path("examples")
+    examples_dir = REPO_ROOT / "examples"
     sample_files = sorted(examples_dir.glob("well_diagnosis*.json")) if examples_dir.exists() else []
-
     if sample_files:
         chosen = st.selectbox("Or load an example", ["(custom)"] + [str(p) for p in sample_files])
     else:
@@ -187,7 +400,6 @@ with tab_drafter:
         with open(chosen) as f:
             preset = json.load(f)
     elif "pe_preset" in st.session_state:
-        # a validated diagnosis loaded from the Production Engineer Copilot
         preset = st.session_state["pe_preset"]
     else:
         preset = {}
@@ -196,14 +408,18 @@ with tab_drafter:
     api = st.text_input("API #", value=preset.get("api_number", ""))
     field = st.text_input("Field", value=preset.get("field", ""))
     operator = st.text_input("Operator", value=preset.get("operator", ""))
-    intervention = st.selectbox("Intervention type", list(COST_TEMPLATES),
-                                index=list(COST_TEMPLATES).index(preset.get("intervention", "acid_stimulation"))
-                                if preset.get("intervention") in COST_TEMPLATES else 0)
+    intervention = st.selectbox(
+        "Intervention type", list(COST_TEMPLATES),
+        index=list(COST_TEMPLATES).index(preset.get("intervention", "acid_stimulation"))
+        if preset.get("intervention") in COST_TEMPLATES else 0)
     diagnosis_text = st.text_area("Primary diagnosis (free-form)",
                                   value=preset.get("primary_diagnosis", ""), height=120)
-    incremental_rate = st.number_input("Incremental uplift (BOPD)", value=float(preset.get("incremental_rate_bopd", 100)))
-    decline = st.number_input("Uplift decline (per year)", value=float(preset.get("expected_uplift_decline_per_yr", 0.6)))
-    requested_by = st.text_input("Requested by", value=preset.get("requested_by", "Eric Diaz, Staff PE"))
+    incremental_rate = st.number_input("Incremental uplift (BOPD)",
+                                       value=float(preset.get("incremental_rate_bopd", 100)))
+    decline = st.number_input("Uplift decline (per year)",
+                              value=float(preset.get("expected_uplift_decline_per_yr", 0.6)))
+    requested_by = st.text_input("Requested by",
+                                 value=preset.get("requested_by", "Eric Diaz, Staff PE"))
 
     # ---- Net economics & price deck (deterministic — no API key needed) -----
     st.markdown("---")
@@ -214,29 +430,7 @@ with tab_drafter:
     gc2.metric("Tangible (capitalized)", f"${rollup['tangible']:,.0f}")
     gc3.metric("Intangible (IDC)", f"${rollup['intangible']:,.0f}")
 
-    # ---- Cost waterfall: direct line items → contingency → total AFE --------
-    _wf_items = lookup_cost_template(intervention)
-    _direct = [li for li in _wf_items if li.category != "Contingency"]
-    _contingency = sum(li.total_usd for li in _wf_items if li.category == "Contingency")
-    _wf_labels = [li.category for li in _direct] + ["Contingency", "Total AFE cost"]
-    _wf_measures = ["relative"] * (len(_direct) + 1) + ["total"]
-    _wf_values = [li.total_usd for li in _direct] + [_contingency, 0]
-    fig_wf = go.Figure(go.Waterfall(
-        orientation="v",
-        measure=_wf_measures,
-        x=_wf_labels,
-        y=_wf_values,
-        text=[f"${v:,.0f}" for v in _wf_values[:-1]] + [f"${rollup['total']:,.0f}"],
-        textposition="outside",
-        connector={"line": {"color": theme.GRID}},
-        increasing={"marker": {"color": theme.BLUE}},
-        decreasing={"marker": {"color": theme.RED}},
-        totals={"marker": {"color": theme.NAVY}},
-        hovertemplate="%{x}: $%{y:,.0f}<extra></extra>",
-    ))
-    fig_wf.update_layout(title="Cost waterfall — line items → contingency → total AFE",
-                         yaxis_title="USD")
-    st.plotly_chart(theme.style_fig(fig_wf, height=360, legend=False), width="stretch")
+    st.plotly_chart(_cost_waterfall(intervention, rollup["total"]), width="stretch")
 
     wc1, wc2, wc3 = st.columns(3)
     working_interest = wc1.number_input("Working interest (WI)", 0.0, 1.0, 1.0, 0.05,
@@ -254,7 +448,8 @@ with tab_drafter:
         nc1.metric("Gross NPV @ 10%", f"${net.npv_10pct_usd/1e6:,.2f}M")
         nc2.metric("Net NPV to operator", f"${net.net_npv_10pct_usd/1e6:,.2f}M",
                    help="WI% of cost, NRI% of revenue — what the operator actually books.")
-        nc3.metric("Payout", f"{net.payout_months:.0f} mo" if net.payout_months != float('inf') else "—")
+        nc3.metric("Payout", f"{net.payout_months:.0f} mo"
+                   if net.payout_months != float('inf') else "—")
 
         deck = price_sensitivity(rollup["total"], incremental_rate,
                                  uplift_decline_per_yr=decline,
@@ -287,8 +482,7 @@ with tab_drafter:
     st.caption(
         "10,000 trials over incremental rate (±30%), uplift decline (±0.15 abs), "
         "and realized price (~$12 sd). Treatment cost is the benchmark estimate for "
-        "the selected intervention."
-    )
+        "the selected intervention.")
     if not _MC_AVAILABLE:
         st.info("Probabilistic economics is temporarily unavailable in this build; "
                 "the rest of the app is unaffected.")
@@ -307,32 +501,7 @@ with tab_drafter:
             m2.metric("P50 NPV (median)", f"${mc.npv_p50_usd/1e6:,.2f}M")
             m3.metric("P90 NPV (upside)", f"${mc.npv_p90_usd/1e6:,.2f}M")
             m4.metric("P(payout < 24 mo)", f"{mc.probability_of_payout*100:.0f}%")
-
-            # Tornado chart: bars sorted by swing, centered on base NPV.
-            items = sorted(mc.tornado.items(), key=lambda kv: kv[1]["swing"])
-            labels = [k.replace("_", " ") for k, _ in items]
-            lows = [v["low"] for _, v in items]
-            highs = [v["high"] for _, v in items]
-            base = mc.base_npv_usd
-            fig_t = go.Figure()
-            fig_t.add_trace(go.Bar(
-                y=labels, x=[base - lo for lo in lows], base=lows,
-                orientation="h", name="downside", marker_color=theme.RED,
-                hovertemplate="low NPV: $%{base:,.0f}<extra></extra>",
-            ))
-            fig_t.add_trace(go.Bar(
-                y=labels, x=[hi - base for hi in highs], base=base,
-                orientation="h", name="upside", marker_color=theme.BLUE,
-                hovertemplate="high NPV: $%{x:,.0f}<extra></extra>",
-            ))
-            fig_t.add_vline(x=base, line_dash="dash", line_color=theme.NAVY,
-                            annotation_text=f"base ${base/1e6:,.2f}M")
-            fig_t.update_layout(
-                barmode="overlay", showlegend=True,
-                xaxis_title="NPV @ 10% (USD)",
-                title="Tornado — NPV swing per variable",
-            )
-            st.plotly_chart(theme.style_fig(fig_t, height=320), width="stretch")
+            st.plotly_chart(_tornado_fig(mc), width="stretch")
 
     if st.button("Draft AFE", type="primary"):
         if not well_id or not diagnosis_text:
@@ -353,7 +522,6 @@ with tab_drafter:
                 dl_md.download_button(
                     "Download .md", markdown,
                     file_name=f"AFE_{well_id}_{intervention}.md")
-                # Render the polished .docx (build_docx writes to a path → read bytes).
                 from src.docx_builder import build_docx
                 with tempfile.TemporaryDirectory() as _td:
                     _docx_path = build_docx(
@@ -364,12 +532,12 @@ with tab_drafter:
                     file_name=f"AFE_{well_id}_{intervention}.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
             except MissingAPIKey:
-                st.warning("Enter your **Anthropic API key** in the sidebar to draft the AFE narrative. "
-                           "Everything else on this page — cost tables, tangible/intangible split, net "
-                           "economics, price deck, and Monte-Carlo — works without a key.")
+                st.warning("Enter your **Anthropic API key** above to draft the AFE narrative. "
+                           "Everything else on this page — cost tables, tangible/intangible split, "
+                           "net economics, price deck, and Monte-Carlo — works without a key.")
 
-# ------------ Variance tab --------------------------------------------------
-with tab_variance:
+
+def _variance_panel() -> None:
     st.subheader("Actual-vs-AFE variance (closed-out AFEs)")
     st.caption("Demo actuals for two closed AFEs — including a 100%-unbudgeted 'Fishing' line "
                "and a rig overrun that trips the supplemental-AFE policy (>10%).")
@@ -402,8 +570,8 @@ with tab_variance:
     disp.columns = ["AFE", "Category", "AFE budget", "Actual", "Variance"]
     st.dataframe(disp, width="stretch", hide_index=True)
 
-# ------------ Benchmarks tab ------------------------------------------------
-with tab_benchmarks:
+
+def _benchmarks_panel() -> None:
     st.subheader("Reference cost per intervention (synthetic Permian benchmarks)")
     rows = []
     for interv in COST_TEMPLATES:
@@ -417,3 +585,210 @@ with tab_benchmarks:
     st.dataframe(bench_df, width="stretch", hide_index=True)
     st.caption("Tangible = capitalized equipment (depreciated); Intangible = IDC "
                "(rig, services, labor, chemicals — currently expensed).")
+
+
+# =====================================================================
+# PAGE: per-AFE drill-down
+# =====================================================================
+
+def render_afe(afe_id: str) -> None:
+    token = st.session_state.get("_afe_cache_token", 0)
+    df = _pipeline_df(str(DB_PATH), token)
+    match = df[df["afe_number"] == afe_id]
+    if match.empty:
+        theme.header(afe_id, subtitle="AFE not found in the tracker.",
+                     chips=[(f"v{__version__}", "ver")])
+        _back_to_overview()
+        st.warning("This AFE is no longer in the pipeline.")
+        return
+    row = match.iloc[0]
+    intervention = row["intervention"]
+    well_id = row["well_id"]
+    total = float(row["total_cost_usd"])
+
+    meta = _registry_meta(well_id)
+    subtitle = f"{well_id} · {intervention.replace('_', ' ')}"
+    if meta is not None:
+        subtitle += f" · {meta.lift} · {meta.basin} · {meta.formation}"
+    theme.header(
+        f"{afe_id}", subtitle=subtitle,
+        chips=[(f"v{__version__}", "ver"), (row["status"].replace("_", " "), "info"),
+               (row["required_approver"], "warn")],
+    )
+    _back_to_overview()
+
+    # ---- header metrics -----------------------------------------------------
+    rollup = cost_rollup(intervention) if intervention in COST_TEMPLATES else None
+    h = st.columns(5)
+    h[0].metric("Gross cost", f"${total:,.0f}")
+    h[1].metric("Status", row["status"].replace("_", " "))
+    h[2].metric("Days in status", int(row["days_in_status"]))
+    h[3].metric("Bottleneck risk", row["bottleneck_risk"])
+    h[4].metric("Rig", row["rig_name"] or "—")
+
+    if intervention not in COST_TEMPLATES:
+        st.info(f"Intervention `{intervention}` has no cost template — showing tracker "
+                "metadata, routing, and audit trail only.")
+        _afe_routing(row, total)
+        _afe_audit(afe_id)
+        _afe_variance(afe_id)
+        _back_to_overview()
+        return
+
+    # ---- cost waterfall -----------------------------------------------------
+    st.subheader("Cost breakdown")
+    cc1, cc2, cc3 = st.columns(3)
+    cc1.metric("AFE total (gross)", f"${rollup['total']:,.0f}")
+    cc2.metric("Tangible (capitalized)", f"${rollup['tangible']:,.0f}")
+    cc3.metric("Intangible (IDC)", f"${rollup['intangible']:,.0f}")
+    st.plotly_chart(_cost_waterfall(intervention, rollup["total"]), width="stretch")
+
+    with st.expander("Line-item detail"):
+        li = lookup_cost_template(intervention)
+        li_df = pd.DataFrame([
+            {"Category": x.category, "Description": x.description, "Qty": x.qty,
+             "Unit": x.unit, "Unit cost $": x.unit_cost_usd, "Total $": x.total_usd,
+             "Vendor": x.vendor or "TBD", "Class": x.cost_class}
+            for x in li])
+        st.dataframe(li_df, width="stretch", hide_index=True,
+                     column_config={
+                         "Unit cost $": st.column_config.NumberColumn(format="$%,.0f"),
+                         "Total $": st.column_config.NumberColumn(format="$%,.0f"),
+                     })
+
+    # ---- net economics + tornado -------------------------------------------
+    _afe_economics(intervention, total)
+
+    # ---- risk register ------------------------------------------------------
+    st.subheader("Risk register")
+    risks = lookup_risks(intervention)
+    if risks:
+        risk_df = pd.DataFrame([
+            {"Category": r.category, "Risk": r.description, "Likelihood": r.likelihood,
+             "Consequence": r.consequence, "Mitigation": r.mitigation}
+            for r in risks])
+        st.dataframe(risk_df, width="stretch", hide_index=True)
+    else:
+        st.caption("No standard risk register for this intervention.")
+
+    # ---- authority routing --------------------------------------------------
+    _afe_routing(row, total)
+
+    # ---- audit trail --------------------------------------------------------
+    _afe_audit(afe_id)
+
+    # ---- variance for this AFE ---------------------------------------------
+    _afe_variance(afe_id)
+
+    _back_to_overview()
+
+
+def _afe_economics(intervention: str, total: float) -> None:
+    st.subheader("Net economics")
+    if not _MC_AVAILABLE:
+        st.info("Economics module unavailable in this build.")
+        return
+    if intervention == "p_and_a":
+        st.caption("P&A / cost-only job — no production uplift, so NPV / payout do not apply. "
+                   "Justified against remaining liability, plugging-bond release, and avoided "
+                   "idle-well carrying cost.")
+        return
+    from src.economics import compute_economics as _ce
+    # Nominal +100 BOPD at base assumptions — deterministic, for the drill-down view.
+    rate = 100.0
+    net = _ce(total, rate)
+    e1, e2, e3 = st.columns(3)
+    e1.metric("Gross NPV @ 10%", f"${net.npv_10pct_usd/1e6:,.2f}M")
+    e2.metric("Net NPV to operator", f"${net.net_npv_10pct_usd/1e6:,.2f}M")
+    e3.metric("Payout", f"{net.payout_months:.0f} mo"
+              if net.payout_months != float('inf') else "—")
+    st.caption(f"Illustrative at +{rate:,.0f} BOPD uplift, base price/decline deck "
+               "(this AFE's actual uplift lives in the source diagnosis).")
+    mc = simulate_economics(treatment_cost_usd=total, incremental_rate_bopd=rate)
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("P10 NPV", f"${mc.npv_p10_usd/1e6:,.2f}M")
+    t2.metric("P50 NPV", f"${mc.npv_p50_usd/1e6:,.2f}M")
+    t3.metric("P90 NPV", f"${mc.npv_p90_usd/1e6:,.2f}M")
+    t4.metric("P(payout < 24 mo)", f"{mc.probability_of_payout*100:.0f}%")
+    st.plotly_chart(_tornado_fig(mc), width="stretch")
+
+
+def _afe_routing(row, total: float) -> None:
+    st.subheader("Authority routing")
+    approver = row["required_approver"]
+    st.markdown(
+        f"This **${total:,.0f}** AFE requires sign-off at the **{approver}** authority level.")
+    st.caption("Delegation-of-authority limits: Production Engineer < $50k · "
+               "Engineering Manager < $250k · Operations Manager < $1MM · VP / Asset Manager above.")
+    # Visual ladder of the approval chain up to the required level.
+    chain = ["Production Engineer", "Engineering Manager", "Operations Manager", "VP / Asset Manager"]
+    try:
+        idx = chain.index(approver)
+    except ValueError:
+        idx = len(chain) - 1
+    for i, role in enumerate(chain):
+        theme.flag(role + (" ✔ required" if i == idx else ""),
+                   "ok" if i <= idx else "warn")
+
+
+def _afe_audit(afe_id: str) -> None:
+    st.subheader("Status / audit trail")
+    token = st.session_state.get("_afe_cache_token", 0)
+    ev = _events_df(str(DB_PATH), afe_id, token)
+    if ev.empty:
+        st.caption("No status-change events recorded for this AFE.")
+        return
+    st.caption("Immutable status-change log (newest first) — every transition is appended, "
+               "never overwritten (what an internal-audit / SOX reviewer expects).")
+    st.dataframe(ev[["ts", "from_status", "to_status", "actor", "note"]],
+                 width="stretch", hide_index=True)
+
+
+def _afe_variance(afe_id: str) -> None:
+    st.subheader("Actual-vs-AFE variance")
+    m = _variance_for(afe_id)
+    if m is None:
+        st.caption("No closed-out actuals recorded for this AFE yet.")
+        return
+    budget = float(m["line_total_usd"].sum())
+    actual = float(m["actual_usd"].sum())
+    var_pct = ((actual - budget) / budget * 100.0) if budget else 0.0
+    vc1, vc2, vc3 = st.columns(3)
+    vc1.metric("AFE budget", f"${budget:,.0f}")
+    vc2.metric("Actual", f"${actual:,.0f}")
+    vc3.metric("Variance", f"{var_pct:+.1f}%",
+               delta=f"${actual - budget:,.0f}", delta_color="inverse")
+    if var_pct > SUPPLEMENT_THRESHOLD_PCT:
+        st.error(f"⚠️ Supplemental AFE required — actuals exceed the AFE by >{SUPPLEMENT_THRESHOLD_PCT:.0f}%.")
+    disp = m.copy()
+    for c in ("line_total_usd", "actual_usd", "variance_usd"):
+        disp[c] = disp[c].apply(lambda v: f"${v:,.0f}")
+    disp = disp[["category", "line_total_usd", "actual_usd", "variance_usd"]]
+    disp.columns = ["Category", "AFE budget", "Actual", "Variance"]
+    st.dataframe(disp, width="stretch", hide_index=True)
+
+
+# =====================================================================
+# Shared setup (runs every rerun) + navigation
+# =====================================================================
+
+theme.setup_page("AFE Copilot", icon="📝")
+theme.suite_nav("afe")
+
+# Seed demo AFEs on first run so the per-AFE pages exist (reuses existing seed logic).
+if not DB_PATH.exists():
+    seed_demo_data(DB_PATH)
+    _bump_cache_token()
+
+_token = st.session_state.get("_afe_cache_token", 0)
+_df = _pipeline_df(str(DB_PATH), _token)
+
+overview = st.Page(render_overview, title="Overview", icon="📋", default=True)
+afe_pages = [
+    st.Page(partial(render_afe, afe_no), title=afe_no, url_path=afe_no)
+    for afe_no in (sorted(_df["afe_number"]) if not _df.empty else [])
+]
+nav_spec = {"Overview": [overview]}
+if afe_pages:
+    nav_spec["AFEs"] = afe_pages
+st.navigation(nav_spec).run()
