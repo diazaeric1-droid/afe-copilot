@@ -578,6 +578,14 @@ def _drafter_panel() -> None:
                 st.warning("Enter your **Anthropic API key** above to draft the AFE narrative. "
                            "Everything else on this page — cost tables, tangible/intangible split, "
                            "net economics, price deck, and Monte-Carlo — works without a key.")
+            except Exception as _draft_err:  # bad/out-of-credit key, rate limit, network, docx
+                st.error(
+                    "The AFE narrative couldn't be drafted — the Anthropic API call failed "
+                    "(commonly an invalid, rate-limited, or out-of-credit key). Check the key "
+                    "you entered above and try again. Everything else on this page — cost "
+                    "tables, tangible/intangible split, net economics, price deck, and "
+                    "Monte-Carlo — works without a key.")
+                st.caption(f"Details: {type(_draft_err).__name__}: {_draft_err}")
 
 
 def _variance_panel() -> None:
