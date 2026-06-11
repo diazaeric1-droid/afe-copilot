@@ -586,6 +586,57 @@ def _drafter_panel() -> None:
                     "tables, tangible/intangible split, net economics, price deck, and "
                     "Monte-Carlo — works without a key.")
                 st.caption(f"Details: {type(_draft_err).__name__}: {_draft_err}")
+            else:
+                # Stash the current form values so the submit button below can read them
+                # even after Streamlit reruns this panel (button click → rerun).
+                st.session_state["_pending_draft"] = {
+                    "well_id": well_id,
+                    "intervention": intervention,
+                    "total_cost_usd": total_estimate(intervention),
+                    "requested_by": requested_by,
+                }
+
+    # ---- Submit drafted AFE to the pipeline tracker -------------------------
+    pending = st.session_state.get("_pending_draft")
+    if pending:
+        st.divider()
+        st.caption(
+            f"Draft ready: **{pending['well_id']}** · {pending['intervention'].replace('_', ' ')} "
+            f"· gross ${pending['total_cost_usd']:,.0f}"
+        )
+        if st.button("Submit to Pipeline", type="primary", key="submit_to_pipeline"):
+            import datetime as _dt
+            tracker = _get_tracker(str(DB_PATH))
+            # Generate a sequential AFE number that won't collide with seed rows.
+            _tok = st.session_state.get("_afe_cache_token", 0)
+            _existing = _pipeline_df(str(DB_PATH), _tok)
+            _next_num = (
+                max(
+                    (int(n.split("-")[-1]) for n in _existing["afe_number"]
+                     if n.startswith("AFE-")),
+                    default=53,
+                ) + 1
+            )
+            new_afe_id = f"AFE-{_dt.date.today().year}-{_next_num:04d}"
+            today_iso = _dt.date.today().isoformat()
+            from src.tracker import AFERecord as _AFERec
+            tracker.upsert(_AFERec(
+                afe_number=new_afe_id,
+                well_id=pending["well_id"],
+                intervention=pending["intervention"],
+                total_cost_usd=pending["total_cost_usd"],
+                status="draft",
+                created_date=today_iso,
+                last_updated=today_iso,
+                requested_by=pending["requested_by"],
+                notes="Submitted via Draft New AFE",
+            ))
+            # Clear the pending draft and bust the pipeline cache so the table refreshes.
+            del st.session_state["_pending_draft"]
+            _bump_cache_token()
+            st.success(f"AFE **{new_afe_id}** added to the pipeline as *draft*. "
+                       "Refresh the Overview to see it in the table.")
+            st.rerun()
 
 
 def _variance_panel() -> None:
