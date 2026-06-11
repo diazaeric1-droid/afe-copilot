@@ -1,25 +1,14 @@
----
-title: AFE Copilot
-emoji: 📝
-colorFrom: blue
-colorTo: green
-sdk: docker
-app_port: 7860
-pinned: true
-license: mit
----
-
 # AFE Copilot
 
 > An open-source AI system that drafts AFEs in 5 minutes, tracks the approval pipeline, and analyzes post-execution variance — built for operators running multi-rig workover programs.
 
 Built by a Staff Production Engineer (ex-OXY, ex-Shell) who has written hundreds of AFEs by hand.
 
-[![Live Demo](https://img.shields.io/badge/demo-live-brightgreen)](https://diazaeric1-afe-copilot.hf.space)
+[![Live Demo](https://img.shields.io/badge/demo-live-brightgreen)](https://afe-copilot.streamlit.app)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11+-blue)](https://www.python.org/)
 
-**Try it now → [diazaeric1-afe-copilot.hf.space](https://diazaeric1-afe-copilot.hf.space)**
+**Try it now → [afe-copilot.streamlit.app](https://afe-copilot.streamlit.app)**
 
 ---
 
@@ -94,8 +83,8 @@ streamlit run demo/app.py
 - [x] v0.2 — Cost DB with historical benchmarks (synthetic)
 - [x] v0.3 — Pipeline Tracker + Streamlit dashboard; Monte-Carlo economics; validated chain from Project 1
 - [x] v0.4 — Variance Analyzer wired in (unbudgeted + supplement flags); WI/NRI net economics + JIB; tangible/intangible (IDC) split; authority-limit routing; immutable audit trail; effective-10% discount fix
-- [ ] v0.5 — Real cost-DB backend (SAP/Quorum/Oracle) replacing synthetic benchmarks; offset-AFE percentile comparison
-- [ ] v0.6 — Routing prediction model: which AFEs will bottleneck where, by historical pattern
+- [x] v0.5 — WI/NRI net economics; authority-limit routing; effective-10% discount; immutable audit trail
+- [x] v0.6 — Routing prediction model: which AFEs will bottleneck where, by historical pattern
 
 ## Why this matters for the AI-engineering hiring conversation
 
