@@ -5,6 +5,10 @@ All notable changes to AFE Copilot are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] — 2026-06-11
+### Changed
+- Economics now backed by shared `econ_core` kernel; numbers unchanged.
+
 ## [0.6.1] — 2026-06-07
 ### Changed
 - **Light theme** — suite-wide migration from dark/navy to a professional light palette (white surfaces, `plotly_white` charts, navy/blue accents retained); transparent fixed header so the title never clips. `runtime.txt` pinned to Python 3.11.

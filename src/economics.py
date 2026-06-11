@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from . import econ_core as _ec
+
 
 @dataclass
 class AFEEconomics:
@@ -34,22 +36,18 @@ def compute_economics(
     working_interest: float = 1.0,
     net_revenue_interest: float = 1.0,
 ) -> AFEEconomics:
-    days_per_month = 365.25 / 12  # avoid the 360-day-year undercount
-    months = np.arange(1, horizon_years * 12 + 1)
-    monthly_rate = incremental_rate_bopd * np.exp(-uplift_decline_per_yr * (months / 12))
-    monthly_vol = monthly_rate * days_per_month
+    months = _ec.month_index(horizon_years)
+    monthly_rate = _ec.exp_uplift_rate(incremental_rate_bopd, uplift_decline_per_yr, months)
+    monthly_vol = monthly_rate * _ec.DAYS_PER_MONTH
     margin_per_bbl = realized_price_per_bbl - opex_per_bbl
     monthly_revenue = monthly_vol * margin_per_bbl
+
     # TRUE effective-annual discounting: a 10% input means 10% per YEAR, so the
     # monthly factor is (1+r)^(m/12), not (1+r/12)^m (which is 10.47% effective).
-    discount_factors = (1 + discount_rate) ** (months / 12)
-    npv = float(np.sum(monthly_revenue / discount_factors) - treatment_cost_usd)
+    pv = _ec.discounted_pv(monthly_revenue, discount_rate)
+    npv = pv - treatment_cost_usd
 
-    # cumulative[i] is cumulative net revenue at the END of month i+1, so the
-    # recovery month is the 1-based (payout_idx + 1).
-    cumulative = np.cumsum(monthly_revenue)
-    payout_idx = int(np.searchsorted(cumulative, treatment_cost_usd))
-    payout_months = float(payout_idx + 1) if payout_idx < len(months) else float("inf")
+    payout = _ec.payout_months(monthly_revenue, treatment_cost_usd)
 
     first_year_bbl = float(monthly_vol[:12].sum())
     eur = float(monthly_vol.sum())
@@ -57,14 +55,15 @@ def compute_economics(
 
     # Operator's net position: it bears WI% of the cost and keeps NRI% of revenue.
     net_cost = treatment_cost_usd * working_interest
-    net_npv = float(np.sum(monthly_revenue * net_revenue_interest / discount_factors) - net_cost)
+    net_pv = _ec.discounted_pv(monthly_revenue * net_revenue_interest, discount_rate)
+    net_npv = net_pv - net_cost
 
     return AFEEconomics(
         treatment_cost_usd=treatment_cost_usd,
         incremental_first_year_bbl=first_year_bbl,
         incremental_eur_bbl=eur,
         npv_10pct_usd=npv,
-        payout_months=payout_months,
+        payout_months=payout,
         dollars_per_incremental_bbl=dollars_per_bbl,
         working_interest=working_interest,
         net_revenue_interest=net_revenue_interest,
@@ -141,18 +140,19 @@ def _npv_vectorized(
     the monthly time axis yields an (n_draws,) NPV vector (or a scalar). This is
     the same formula as compute_economics, just batched for Monte-Carlo speed.
     """
-    days_per_month = 365.25 / 12
-    months = np.arange(1, horizon_years * 12 + 1)               # (T,)
-    rate = np.atleast_1d(np.asarray(incremental_rate_bopd, dtype=float))[:, None]      # (n,1)
-    decline = np.atleast_1d(np.asarray(uplift_decline_per_yr, dtype=float))[:, None]   # (n,1)
-    price = np.atleast_1d(np.asarray(realized_price_per_bbl, dtype=float))[:, None]    # (n,1)
+    months = _ec.month_index(horizon_years)                                    # (T,)
+    rate = np.atleast_1d(np.asarray(incremental_rate_bopd, dtype=float))      # (n,)
+    decline = np.atleast_1d(np.asarray(uplift_decline_per_yr, dtype=float))   # (n,)
+    price = np.atleast_1d(np.asarray(realized_price_per_bbl, dtype=float))    # (n,)
 
-    monthly_rate = rate * np.exp(-decline * (months[None, :] / 12))      # (n,T)
-    monthly_vol = monthly_rate * days_per_month
-    margin_per_bbl = price - opex_per_bbl                                # (n,1)
-    monthly_revenue = monthly_vol * margin_per_bbl                       # (n,T)
-    discount_factors = (1 + discount_rate) ** (months / 12)             # (T,) effective-annual
-    npv = np.sum(monthly_revenue / discount_factors, axis=1) - treatment_cost_usd
+    # exp_uplift_rate batched path -> (n, T)
+    monthly_rate = _ec.exp_uplift_rate(rate, decline, months)                  # (n,T)
+    monthly_vol = monthly_rate * _ec.DAYS_PER_MONTH                            # (n,T)
+    margin_per_bbl = price - opex_per_bbl                                      # (n,)
+    monthly_revenue = monthly_vol * margin_per_bbl[:, None]                    # (n,T)
+
+    # discounted_pv handles (n,T) -> (n,) via its axis=-1 sum
+    npv = _ec.discounted_pv(monthly_revenue, discount_rate) - treatment_cost_usd
     return npv  # (n,)
 
 
@@ -167,15 +167,17 @@ def _payout_within(
 ) -> np.ndarray:
     """Boolean array: did the (undiscounted) cumulative net revenue recover the
     treatment cost within months_cap, per draw? Mirrors compute_economics payout."""
-    days_per_month = 365.25 / 12
-    months = np.arange(1, horizon_years * 12 + 1)
-    rate = np.atleast_1d(np.asarray(incremental_rate_bopd, dtype=float))[:, None]
-    decline = np.atleast_1d(np.asarray(uplift_decline_per_yr, dtype=float))[:, None]
-    price = np.atleast_1d(np.asarray(realized_price_per_bbl, dtype=float))[:, None]
-    monthly_vol = rate * np.exp(-decline * (months[None, :] / 12)) * days_per_month
-    monthly_revenue = monthly_vol * (price - opex_per_bbl)
-    cumulative = np.cumsum(monthly_revenue, axis=1)             # (n,T)
+    months = _ec.month_index(horizon_years)
+    rate = np.atleast_1d(np.asarray(incremental_rate_bopd, dtype=float))      # (n,)
+    decline = np.atleast_1d(np.asarray(uplift_decline_per_yr, dtype=float))   # (n,)
+    price = np.atleast_1d(np.asarray(realized_price_per_bbl, dtype=float))    # (n,)
+
+    # exp_uplift_rate batched -> (n, T)
+    monthly_vol = _ec.exp_uplift_rate(rate, decline, months) * _ec.DAYS_PER_MONTH
+    monthly_revenue = monthly_vol * (price - opex_per_bbl)[:, None]           # (n,T)
+
     cap = max(1, min(months_cap, len(months)))   # guard months_cap <= 0
+    cumulative = np.cumsum(monthly_revenue, axis=1)             # (n,T)
     # recovered within cap months if cumulative at month `cap` >= cost
     return cumulative[:, cap - 1] >= treatment_cost_usd
 
