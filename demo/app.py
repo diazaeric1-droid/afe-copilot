@@ -340,6 +340,8 @@ def _overview_table(df: pd.DataFrame) -> None:
             "Net NPV $": st.column_config.NumberColumn(format="$%,.0f"),
         },
     )
+    st.download_button("⬇ Download pipeline (CSV)", data=table.to_csv(index=False),
+                       file_name="afe_pipeline.csv", mime="text/csv")
     st.caption("`Required approver` is the delegation-of-authority level the AFE's $ value "
                "needs (PE < $50k · Eng Mgr < $250k · Ops Mgr < $1MM · VP above).")
     theme.source_note(
@@ -671,6 +673,8 @@ def _variance_panel() -> None:
         disp[c] = disp[c].apply(lambda v: f"${v:,.0f}")
     disp.columns = ["AFE", "Category", "AFE budget", "Actual", "Variance"]
     st.dataframe(disp, width="stretch", hide_index=True)
+    st.download_button("⬇ Download variance (CSV)", data=merged.to_csv(index=False),
+                       file_name="afe_variance.csv", mime="text/csv")
     theme.source_note(
         "Per-category variance (USD) = actual − AFE budget; rows sorted by largest "
         "overrun. Supplemental AFE flags an overrun above the policy threshold "
